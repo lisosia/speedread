@@ -806,6 +806,73 @@ def _write_json_payloads(
         json.dump(selected_payload, f, ensure_ascii=False, indent=2)
 
 
+def _add_sim_prev_reset(raw_items: List[Dict[str, object]]) -> None:
+    prev_norm: Optional[str] = None
+    for item in raw_items:
+        text_value = item.get("ocr_text") or ""
+        if not text_value:
+            item["sim_prev"] = None
+            prev_norm = None
+            continue
+        norm = _normalize_text(text_value)
+        if prev_norm is None:
+            item["sim_prev"] = None
+        else:
+            item["sim_prev"] = _text_similarity(norm, prev_norm)
+        prev_norm = norm
+
+
+def _write_pages_raw(
+    output_dir: str,
+    source_video_path: str,
+    raw_items: List[Dict[str, object]],
+    compute_sim_prev: bool = True,
+) -> None:
+    if compute_sim_prev:
+        _add_sim_prev_reset(raw_items)
+    else:
+        for item in raw_items:
+            item["sim_prev"] = None
+    raw_payload = {"source_video_path": source_video_path, "items": raw_items}
+    with open(os.path.join(output_dir, "pages_raw.json"), "w", encoding="utf-8") as f:
+        json.dump(raw_payload, f, ensure_ascii=False, indent=2)
+
+
+def _load_json(path: str) -> Optional[Dict[str, object]]:
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _load_pages_raw(output_dir: str) -> Optional[Tuple[str, List[Dict[str, object]]]]:
+    data = _load_json(os.path.join(output_dir, "pages_raw.json"))
+    if not data:
+        return None
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        return None
+    source_video_path = data.get("source_video_path") or ""
+    return source_video_path, items
+
+
+def _load_pages_selected(output_dir: str) -> Optional[List[Dict[str, object]]]:
+    data = _load_json(os.path.join(output_dir, "pages_selected.json"))
+    if not data:
+        return None
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        return None
+    return items
+
+
+def _read_text_file(path: str) -> Optional[str]:
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
 def _write_progress_json(
     output_dir: str,
     source_video_path: str,
@@ -864,118 +931,330 @@ def extract_pages(
         output_dir = tempfile.mkdtemp(prefix="speedread_")
 
     ensure_dir(output_dir)
-    if progress_cb:
-        progress_cb(5, "Decoding analysis frames")
-    _frames, infos, video_info = decode_analysis_frames(
-        video_path,
-        params.analysis_fps,
-        params.analysis_long_side,
-        rotation_degrees=params.rotation_degrees,
-        progress_cb=progress_cb,
-        should_stop=should_stop,
-    )
+    pages_dir = os.path.join(output_dir, "pages")
+    ensure_dir(pages_dir)
 
-    if should_stop and should_stop():
-        return output_dir, [], []
+    raw_items: List[Dict[str, object]] = []
+    raw_frames: List[RawFrame] = []
 
     if progress_cb:
-        progress_cb(20, "Running local LLM transcription (hi-res)")
-    texts, texts_norm, _change_raw, change_smooth, raw_frames = compute_text_change_series(
-        video_path,
-        infos,
-        params,
-        progress_cb=progress_cb,
-        should_stop=should_stop,
-        output_dir=output_dir,
-        on_item=on_item,
-    )
+        progress_cb(5, "Preparing pages")
 
-    if should_stop and should_stop():
-        return output_dir, [], []
+    loaded = _load_pages_raw(output_dir)
+    existing_items: List[Dict[str, object]] = []
+    if loaded:
+        _source, existing_items = loaded
 
-    fps = max(0.01, float(params.analysis_fps))
-    n_trans_min = 1
-    n_trans_max = max(1, int(round(params.max_interval_s * fps)))
-    boundaries = segment_by_two_refs_texts(
-        texts_norm,
-        thr=0.2,
-        n_trans_min=n_trans_min,
-        n_trans_max=n_trans_max,
-    )
-
-    if progress_cb:
-        progress_cb(50, f"Selecting frames ({len(boundaries)})")
-
-    selections: List[Dict[str, object]] = []
-    if not boundaries and progress_cb:
-        progress_cb(55, "No text segments found, exporting all frames")
-
-    selected_indices = _select_analysis_indices(boundaries, len(texts_norm), n_trans_max)
-    if not selected_indices and progress_cb:
-        progress_cb(55, "No frames selected, exporting all frames")
-
-    for mid in selected_indices:
-        score_val = change_smooth[mid] if mid < len(change_smooth) else 0.0
-        selections.append(
-            {
-                "analysis_index": mid,
-                "pce_peak_index": mid,
-                "score_components": {"text_change": float(score_val)},
-            }
+    if existing_items:
+        existing_items = sorted(
+            existing_items, key=lambda item: int(item.get("raw_index", 0))
         )
-
-    results: List[PageResult] = []
-    selection_map = {sel["analysis_index"]: sel for sel in selections}
-    for idx, raw in enumerate(raw_frames):
-        sel = selection_map.get(raw.analysis_index)
-        if sel is not None:
-            result = PageResult(
-                image_path=raw.image_path,
-                timestamp_ms=raw.timestamp_ms,
-                analysis_index=raw.analysis_index,
-                pce_peak_index=int(sel["pce_peak_index"]),
-                score_components=sel["score_components"],
-                warp_applied=False,
-                quad_points=None,
-                ocr_text=raw.ocr_text,
+        cap: Optional[cv2.VideoCapture] = None
+        total = len(existing_items)
+        for idx, item in enumerate(existing_items, start=1):
+            if should_stop and should_stop():
+                if cap:
+                    cap.release()
+                return output_dir, [], raw_frames
+            raw_index = int(item.get("raw_index", idx))
+            analysis_index = int(item.get("analysis_index", idx - 1))
+            timestamp_ms = int(item.get("timestamp_ms", 0))
+            source_frame_index = int(item.get("source_frame_index", -1))
+            rel_image = str(item.get("image") or f"pages/page_{raw_index:04d}.png")
+            rel_image = os.path.normpath(rel_image)
+            image_path = os.path.join(output_dir, rel_image)
+            if not os.path.exists(image_path):
+                if cap is None:
+                    cap = cv2.VideoCapture(video_path)
+                frame = extract_highres_frame(
+                    cap,
+                    frame_index=source_frame_index if source_frame_index >= 0 else None,
+                    time_ms=timestamp_ms,
+                    rotation_degrees=params.rotation_degrees,
+                )
+                cv2.imwrite(image_path, frame)
+            text_path = os.path.join(pages_dir, f"page_{raw_index:04d}.txt")
+            ocr_text = item.get("ocr_text")
+            if not ocr_text:
+                ocr_text = _read_text_file(text_path)
+            raw_items.append(
+                {
+                    "raw_index": raw_index,
+                    "analysis_index": analysis_index,
+                    "source_frame_index": source_frame_index,
+                    "timestamp_ms": timestamp_ms,
+                    "image": rel_image,
+                    "ocr_text": ocr_text,
+                }
             )
-            results.append(result)
+            raw_frames.append(
+                RawFrame(
+                    analysis_index=analysis_index,
+                    source_frame_index=source_frame_index,
+                    timestamp_ms=timestamp_ms,
+                    image_path=image_path,
+                    ocr_text=ocr_text,
+                )
+            )
+            if on_item:
+                on_item(
+                    PageItem(
+                        image_path=image_path,
+                        timestamp_ms=timestamp_ms,
+                        analysis_index=analysis_index,
+                        is_selected=None,
+                        ocr_text=ocr_text,
+                    )
+                )
+            if progress_cb:
+                percent = 5 + int((idx / max(1, total)) * 15)
+                progress_cb(percent, f"Loaded {idx}/{total}")
+        if cap:
+            cap.release()
+    else:
         if progress_cb:
-            percent = 60 + int(((idx + 1) / max(1, len(raw_frames))) * 30)
-            progress_cb(percent, f"Prepared {idx + 1}/{len(raw_frames)}")
+            progress_cb(5, "Decoding analysis frames")
+        _frames, infos, _video_info = decode_analysis_frames(
+            video_path,
+            params.analysis_fps,
+            params.analysis_long_side,
+            rotation_degrees=params.rotation_degrees,
+            progress_cb=progress_cb,
+            should_stop=should_stop,
+        )
+        if should_stop and should_stop():
+            return output_dir, [], []
 
-    if on_item:
-        for raw in raw_frames:
+        cap = cv2.VideoCapture(video_path)
+        total = len(infos)
+        for idx, info in enumerate(infos, start=1):
+            if should_stop and should_stop():
+                break
+            image_path = os.path.join(pages_dir, f"page_{idx:04d}.png")
+            if not os.path.exists(image_path):
+                frame = extract_highres_frame(
+                    cap,
+                    frame_index=info.get("frame_index"),
+                    time_ms=info.get("time_ms"),
+                    rotation_degrees=params.rotation_degrees,
+                )
+                cv2.imwrite(image_path, frame)
+            text_path = os.path.join(pages_dir, f"page_{idx:04d}.txt")
+            ocr_text = _read_text_file(text_path)
+            rel_image = os.path.relpath(image_path, output_dir)
+            raw_items.append(
+                {
+                    "raw_index": idx,
+                    "analysis_index": idx - 1,
+                    "source_frame_index": int(info.get("frame_index", -1)),
+                    "timestamp_ms": int(info.get("time_ms", 0)),
+                    "image": rel_image,
+                    "ocr_text": ocr_text,
+                }
+            )
+            raw_frames.append(
+                RawFrame(
+                    analysis_index=idx - 1,
+                    source_frame_index=int(info.get("frame_index", -1)),
+                    timestamp_ms=int(info.get("time_ms", 0)),
+                    image_path=image_path,
+                    ocr_text=ocr_text,
+                )
+            )
+            if on_item:
+                on_item(
+                    PageItem(
+                        image_path=image_path,
+                        timestamp_ms=int(info.get("time_ms", 0)),
+                        analysis_index=idx - 1,
+                        is_selected=None,
+                        ocr_text=ocr_text,
+                    )
+                )
+            if progress_cb:
+                percent = 5 + int((idx / max(1, total)) * 15)
+                progress_cb(percent, f"Extracted {idx}/{total}")
+        cap.release()
+
+    _write_pages_raw(output_dir, video_path, raw_items, compute_sim_prev=True)
+
+    if should_stop and should_stop():
+        return output_dir, [], raw_frames
+
+    if progress_cb:
+        progress_cb(25, "Transcribing pages")
+
+    raw_frame_map = {frame.analysis_index: frame for frame in raw_frames}
+    total = len(raw_items)
+    for idx, item in enumerate(raw_items, start=1):
+        if should_stop and should_stop():
+            return output_dir, [], raw_frames
+        raw_index = int(item.get("raw_index", idx))
+        text_path = os.path.join(pages_dir, f"page_{raw_index:04d}.txt")
+        ocr_text = item.get("ocr_text")
+        if ocr_text and not os.path.exists(text_path):
+            with open(text_path, "w", encoding="utf-8") as f:
+                f.write(str(ocr_text))
+        if ocr_text:
+            if on_item:
+                on_item(
+                    PageItem(
+                        image_path=os.path.join(output_dir, item["image"]),
+                        timestamp_ms=int(item.get("timestamp_ms", 0)),
+                        analysis_index=int(item.get("analysis_index", idx - 1)),
+                        is_selected=None,
+                        ocr_text=str(ocr_text),
+                    )
+                )
+            if progress_cb:
+                percent = 25 + int((idx / max(1, total)) * 25)
+                progress_cb(percent, f"Transcribed {idx}/{total}")
+            continue
+
+        image_path = os.path.join(output_dir, item["image"])
+        text_value = transcribe_image_file(image_path, params).strip()
+        item["ocr_text"] = text_value
+        with open(text_path, "w", encoding="utf-8") as f:
+            f.write(text_value)
+        frame = raw_frame_map.get(int(item.get("analysis_index", idx - 1)))
+        if frame:
+            frame.ocr_text = text_value
+        _write_pages_raw(output_dir, video_path, raw_items, compute_sim_prev=True)
+        if on_item:
             on_item(
                 PageItem(
-                    image_path=raw.image_path,
-                    timestamp_ms=raw.timestamp_ms,
-                    analysis_index=raw.analysis_index,
-                    is_selected=raw.analysis_index in selection_map,
-                    ocr_text=raw.ocr_text,
+                    image_path=image_path,
+                    timestamp_ms=int(item.get("timestamp_ms", 0)),
+                    analysis_index=int(item.get("analysis_index", idx - 1)),
+                    is_selected=None,
+                    ocr_text=text_value,
+                )
+            )
+        if progress_cb:
+            percent = 25 + int((idx / max(1, total)) * 25)
+            progress_cb(percent, f"Transcribed {idx}/{total}")
+
+    _write_pages_raw(output_dir, video_path, raw_items, compute_sim_prev=True)
+
+    if should_stop and should_stop():
+        return output_dir, [], raw_frames
+
+    if any(not (item.get("ocr_text") or "").strip() for item in raw_items):
+        if progress_cb:
+            progress_cb(55, "Transcription incomplete; skipping selection")
+        return output_dir, [], raw_frames
+
+    if progress_cb:
+        progress_cb(60, "Selecting frames")
+
+    selected_items = _load_pages_selected(output_dir)
+    raw_by_index = {int(item["analysis_index"]): item for item in raw_items}
+    results: List[PageResult] = []
+    selection_map: Dict[int, Dict[str, object]] = {}
+
+    if selected_items is None:
+        texts_norm = [_normalize_text(item.get("ocr_text") or "") for item in raw_items]
+        change_raw = [0.0]
+        for i in range(1, len(texts_norm)):
+            sim = _text_similarity(texts_norm[i], texts_norm[i - 1])
+            change_raw.append(1.0 - sim)
+        change_smooth = _smooth_series(change_raw, window=5)
+
+        fps = max(0.01, float(params.analysis_fps))
+        n_trans_min = 1
+        n_trans_max = max(1, int(round(params.max_interval_s * fps)))
+        boundaries = segment_by_two_refs_texts(
+            texts_norm,
+            thr=0.2,
+            n_trans_min=n_trans_min,
+            n_trans_max=n_trans_max,
+        )
+        selected_indices = _select_analysis_indices(boundaries, len(texts_norm), n_trans_max)
+        selected_items = []
+        for idx, analysis_index in enumerate(selected_indices, start=1):
+            raw = raw_by_index.get(int(analysis_index))
+            if raw is None:
+                continue
+            score_val = (
+                change_smooth[analysis_index] if analysis_index < len(change_smooth) else 0.0
+            )
+            selected_items.append(
+                {
+                    "selected_index": idx,
+                    "analysis_index": int(analysis_index),
+                    "timestamp_ms": int(raw.get("timestamp_ms", 0)),
+                    "image": raw.get("image"),
+                    "ocr_text": raw.get("ocr_text"),
+                    "score_components": {"text_change": float(score_val)},
+                    "warp_applied": False,
+                    "quad_points": None,
+                }
+            )
+    else:
+        for item in selected_items:
+            analysis_index = int(item.get("analysis_index", -1))
+            raw = raw_by_index.get(analysis_index)
+            if raw:
+                item["timestamp_ms"] = int(raw.get("timestamp_ms", 0))
+                item["image"] = raw.get("image")
+                item["ocr_text"] = raw.get("ocr_text")
+
+    if selected_items is None:
+        selected_items = []
+
+    selection_map = {int(item.get("analysis_index", -1)): item for item in selected_items}
+    _add_sim_prev_reset(raw_items)
+    _write_json_payloads(output_dir, video_path, raw_items, selected_items)
+
+    for idx, item in enumerate(selected_items, start=1):
+        analysis_index = int(item.get("analysis_index", -1))
+        image_rel = str(item.get("image") or "")
+        image_path = os.path.join(output_dir, image_rel)
+        results.append(
+            PageResult(
+                image_path=image_path,
+                timestamp_ms=int(item.get("timestamp_ms", 0)),
+                analysis_index=analysis_index,
+                pce_peak_index=analysis_index,
+                score_components=item.get("score_components", {"text_change": 0.0}),
+                warp_applied=bool(item.get("warp_applied", False)),
+                quad_points=item.get("quad_points"),
+                ocr_text=item.get("ocr_text"),
+            )
+        )
+
+    if on_item:
+        for raw in raw_items:
+            analysis_index = int(raw.get("analysis_index", -1))
+            on_item(
+                PageItem(
+                    image_path=os.path.join(output_dir, raw.get("image") or ""),
+                    timestamp_ms=int(raw.get("timestamp_ms", 0)),
+                    analysis_index=analysis_index,
+                    is_selected=analysis_index in selection_map,
+                    ocr_text=raw.get("ocr_text"),
                 )
             )
 
-    _write_progress_json(output_dir, video_path, raw_frames, results)
     if progress_cb:
-        progress_cb(96, "Summarizing")
+        progress_cb(85, "Summarizing")
 
-    summary_text = ""
-    try:
-        summary_inputs = [r.ocr_text or "" for r in results]
-        summary_text = _summarize_recursive(
-            summary_inputs,
-            params,
-            max_input_tokens=20000,
-            max_output_tokens=int(params.llm_max_tokens),
-        )
-    except Exception as exc:
-        summary_text = f"Summary failed: {exc}"
-
-    if output_dir:
-        summary_path = os.path.join(output_dir, "final_summary.txt")
+    summary_path = os.path.join(output_dir, "final_summary.txt")
+    if not os.path.exists(summary_path):
+        summary_text = ""
+        try:
+            summary_inputs = [item.get("ocr_text") or "" for item in selected_items]
+            summary_text = _summarize_recursive(
+                summary_inputs,
+                params,
+                max_input_tokens=20000,
+                max_output_tokens=int(params.llm_max_tokens),
+            )
+        except Exception as exc:
+            summary_text = f"Summary failed: {exc}"
         with open(summary_path, "w", encoding="utf-8") as f:
             f.write(summary_text)
+
     if progress_cb:
         progress_cb(98, "Finalizing")
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
+import json
 from typing import Dict, List, Optional
 
 import cv2
@@ -136,6 +137,13 @@ class MainWindow(QtWidgets.QMainWindow):
         output_layout.addWidget(self.output_root_label, 1)
         output_layout.addWidget(self.output_root_btn)
         input_layout.addLayout(output_layout)
+
+        resume_layout = QtWidgets.QHBoxLayout()
+        self.resume_btn = QtWidgets.QPushButton("Resume")
+        self.resume_btn.clicked.connect(self._resume_extract)
+        resume_layout.addStretch()
+        resume_layout.addWidget(self.resume_btn)
+        input_layout.addLayout(resume_layout)
 
         preset_layout = QtWidgets.QHBoxLayout()
         preset_label = QtWidgets.QLabel("Preset")
@@ -395,6 +403,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 return alt
         return None
 
+    def _write_session(self, output_dir: str, params: ExtractParams) -> None:
+        data = {
+            "video_path": self._video_path,
+            "analysis_fps": params.analysis_fps,
+        }
+        path = os.path.join(output_dir, "session.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _load_session(self, output_dir: str) -> Optional[Dict[str, object]]:
+        path = os.path.join(output_dir, "session.json")
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _is_output_dir_incomplete(self, path: str) -> bool:
+        if not os.path.isdir(path):
+            return False
+        if os.path.exists(os.path.join(path, "final_summary.txt")):
+            return False
+        pages_dir = os.path.join(path, "pages")
+        if os.path.exists(os.path.join(path, "pages_raw.json")):
+            return True
+        return os.path.isdir(pages_dir) and bool(os.listdir(pages_dir))
+
     def _start_extract(self) -> None:
         if not self._video_path:
             QtWidgets.QMessageBox.warning(self, "No video", "Please select a video file")
@@ -406,19 +440,42 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._ensure_output_root():
             return
 
-        output_dir = self._create_output_dir()
-        if not output_dir:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Output folder unavailable",
-                "Failed to create a new output folder.",
-            )
-            return
+        output_dir: Optional[str] = None
+        if self._output_dir and self._is_output_dir_incomplete(self._output_dir):
+            session = self._load_session(self._output_dir)
+            session_video = session.get("video_path") if isinstance(session, dict) else None
+            if session_video and os.path.normpath(str(session_video)) == os.path.normpath(
+                self._video_path
+            ):
+                output_dir = self._output_dir
+                analysis_fps = session.get("analysis_fps") if isinstance(session, dict) else None
+                if analysis_fps is not None:
+                    try:
+                        self.analysis_fps_spin.setValue(float(analysis_fps))
+                    except (TypeError, ValueError):
+                        pass
+        if output_dir is None:
+            output_dir = self._create_output_dir()
+            if not output_dir:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Output folder unavailable",
+                    "Failed to create a new output folder.",
+                )
+                return
 
         self._reset_results()
         self._output_dir = output_dir
+        if output_dir == self._output_dir and os.path.exists(
+            os.path.join(output_dir, "session.json")
+        ):
+            self._log(f"Resuming output folder: {output_dir}")
+        else:
+            self._log(f"Output folder: {output_dir}")
 
         params = self._collect_params()
+        if not os.path.exists(os.path.join(output_dir, "session.json")):
+            self._write_session(output_dir, params)
         self._extract_thread = QtCore.QThread()
         self._extract_worker = ExtractWorker(self._video_path, params, self._output_dir)
         self._extract_worker.moveToThread(self._extract_thread)
@@ -437,6 +494,55 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._extract_worker:
             self._extract_worker.stop()
             self._log("Stopping extraction...")
+
+    def _resume_extract(self) -> None:
+        if self._extract_worker:
+            QtWidgets.QMessageBox.warning(self, "Busy", "Extraction is already running")
+            return
+        start_dir = self._output_root or ""
+        output_dir = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select output folder", start_dir
+        )
+        if not output_dir:
+            return
+        session = self._load_session(output_dir)
+        if not session:
+            QtWidgets.QMessageBox.warning(
+                self, "Resume", "session.json not found in the selected folder."
+            )
+            return
+        video_path = session.get("video_path") if isinstance(session, dict) else None
+        if not video_path or not os.path.exists(str(video_path)):
+            QtWidgets.QMessageBox.warning(
+                self, "Resume", "Original video path not found."
+            )
+            return
+        self._set_video(str(video_path))
+        analysis_fps = session.get("analysis_fps") if isinstance(session, dict) else None
+        if analysis_fps is not None:
+            try:
+                self.analysis_fps_spin.setValue(float(analysis_fps))
+            except (TypeError, ValueError):
+                pass
+
+        self._reset_results()
+        self._output_dir = output_dir
+        self._log(f"Resuming output folder: {output_dir}")
+
+        params = self._collect_params()
+        self._extract_thread = QtCore.QThread()
+        self._extract_worker = ExtractWorker(self._video_path, params, self._output_dir)
+        self._extract_worker.moveToThread(self._extract_thread)
+
+        self._extract_thread.started.connect(self._extract_worker.run)
+        self._extract_worker.progress.connect(self._on_progress)
+        self._extract_worker.item_ready.connect(self._on_item_ready)
+        self._extract_worker.finished.connect(self._on_extract_finished)
+        self._extract_thread.start()
+
+        self.extract_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.open_folder_btn.setEnabled(True)
 
     def _on_progress(self, percent: int, message: str) -> None:
         self.progress_bar.setValue(percent)
