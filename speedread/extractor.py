@@ -15,7 +15,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from .models import PageResult, RawFrame
+from .models import PageItem, PageResult, RawFrame
 from .prompts import get_prompt
 
 
@@ -408,17 +408,25 @@ def compute_text_change_series(
     params: ExtractParams,
     progress_cb: Optional[Callable[[int, str], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
-) -> Tuple[List[str], List[str], List[float], List[float]]:
+    output_dir: Optional[str] = None,
+    on_item: Optional[Callable[[PageItem], None]] = None,
+) -> Tuple[List[str], List[str], List[float], List[float], List[RawFrame]]:
     if not infos:
-        return [], [], [], []
+        return [], [], [], [], []
 
     texts_raw: List[str] = []
     texts_norm: List[str] = []
+    raw_frames: List[RawFrame] = []
     total = len(infos)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError("Failed to open video for LLM transcription")
+
+    pages_dir = None
+    if output_dir:
+        pages_dir = os.path.join(output_dir, "pages")
+        ensure_dir(pages_dir)
 
     try:
         for idx, info in enumerate(infos):
@@ -430,11 +438,51 @@ def compute_text_change_series(
                 time_ms=info.get("time_ms"),
                 rotation_degrees=params.rotation_degrees,
             )
+            image_path = ""
+            if pages_dir is not None:
+                image_path = os.path.join(pages_dir, f"page_{idx + 1:04d}.png")
+                cv2.imwrite(image_path, frame)
+                if on_item:
+                    on_item(
+                        PageItem(
+                            image_path=image_path,
+                            timestamp_ms=int(info.get("time_ms", 0)),
+                            analysis_index=idx,
+                            is_selected=None,
+                            ocr_text=None,
+                        )
+                    )
             text = transcribe_frame(frame, params)
-            texts_raw.append(text.strip())
-            texts_norm.append(_normalize_text(text))
-            if progress_cb and idx % 20 == 0:
-                progress_cb(35, f"LLM {idx + 1}/{total}")
+            text_value = text.strip()
+            texts_raw.append(text_value)
+            texts_norm.append(_normalize_text(text_value))
+            if pages_dir is not None:
+                text_path = os.path.join(pages_dir, f"page_{idx + 1:04d}.txt")
+                with open(text_path, "w", encoding="utf-8") as f:
+                    f.write(text_value)
+                raw_frames.append(
+                    RawFrame(
+                        analysis_index=idx,
+                        source_frame_index=int(info.get("frame_index", -1)),
+                        timestamp_ms=int(info.get("time_ms", 0)),
+                        image_path=image_path,
+                        ocr_text=text_value,
+                    )
+                )
+                _write_progress_json(output_dir, video_path, raw_frames, [])
+                if on_item:
+                    on_item(
+                        PageItem(
+                            image_path=image_path,
+                            timestamp_ms=int(info.get("time_ms", 0)),
+                            analysis_index=idx,
+                            is_selected=None,
+                            ocr_text=text_value,
+                        )
+                    )
+            if progress_cb:
+                percent = 20 + int(((idx + 1) / max(1, total)) * 30)
+                progress_cb(percent, f"LLM {idx + 1}/{total}")
     finally:
         cap.release()
 
@@ -444,7 +492,7 @@ def compute_text_change_series(
         change_raw.append(1.0 - sim)
 
     change_smooth = _smooth_series(change_raw, window=5)
-    return texts_raw, texts_norm, change_raw, change_smooth
+    return texts_raw, texts_norm, change_raw, change_smooth, raw_frames
 
 
 def segment_by_two_refs(
@@ -691,18 +739,15 @@ def extract_pages(
     output_dir: Optional[str] = None,
     progress_cb: Optional[Callable[[int, str], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
-    on_item: Optional[Callable[[PageResult], None]] = None,
+    on_item: Optional[Callable[[PageItem], None]] = None,
 ) -> Tuple[str, List[PageResult], List[RawFrame]]:
     if output_dir is None:
         output_dir = tempfile.mkdtemp(prefix="speedread_")
 
     ensure_dir(output_dir)
-    pages_dir = os.path.join(output_dir, "pages")
-    ensure_dir(pages_dir)
-
     if progress_cb:
         progress_cb(5, "Decoding analysis frames")
-    frames, infos, video_info = decode_analysis_frames(
+    _frames, infos, video_info = decode_analysis_frames(
         video_path,
         params.analysis_fps,
         params.analysis_long_side,
@@ -716,12 +761,14 @@ def extract_pages(
 
     if progress_cb:
         progress_cb(20, "Running local LLM transcription (hi-res)")
-    texts, texts_norm, _change_raw, change_smooth = compute_text_change_series(
+    texts, texts_norm, _change_raw, change_smooth, raw_frames = compute_text_change_series(
         video_path,
         infos,
         params,
         progress_cb=progress_cb,
         should_stop=should_stop,
+        output_dir=output_dir,
+        on_item=on_item,
     )
 
     if should_stop and should_stop():
@@ -752,7 +799,11 @@ def extract_pages(
 
         expanded_starts = [segment_starts[0]]
         for idx, start in enumerate(segment_starts):
-            end = segment_starts[idx + 1] if idx + 1 < len(segment_starts) else len(frames)
+            end = (
+                segment_starts[idx + 1]
+                if idx + 1 < len(segment_starts)
+                else len(texts_norm)
+            )
             current = start
             while (end - current) > n_trans_max:
                 current += n_trans_max
@@ -761,7 +812,11 @@ def extract_pages(
         segment_starts = sorted(set(expanded_starts))
 
         for idx, start in enumerate(segment_starts):
-            end = segment_starts[idx + 1] if idx + 1 < len(segment_starts) else len(frames)
+            end = (
+                segment_starts[idx + 1]
+                if idx + 1 < len(segment_starts)
+                else len(texts_norm)
+            )
             if end <= start:
                 continue
             mid = start + (end - start) // 2
@@ -778,68 +833,39 @@ def extract_pages(
         if progress_cb:
             progress_cb(55, "No frames selected, exporting all frames")
 
-    if progress_cb:
-        progress_cb(60, "Extracting all frames")
-
-    raw_frames: List[RawFrame] = []
     results: List[PageResult] = []
     selection_map = {sel["analysis_index"]: sel for sel in selections}
-    cap = cv2.VideoCapture(video_path)
-    total = len(infos)
-    for idx, info in enumerate(infos):
-        if should_stop and should_stop():
-            break
-        frame = extract_highres_frame(
-            cap,
-            frame_index=info["frame_index"],
-            time_ms=info["time_ms"],
-            rotation_degrees=params.rotation_degrees,
-        )
-
-        quad_points = None
-        warp_applied = False
-
-
-        image_path = os.path.join(pages_dir, f"page_{idx + 1:04d}.png")
-        cv2.imwrite(image_path, frame)
-
-        text_value = texts[idx] if idx < len(texts) else None
-        text_path = os.path.join(pages_dir, f"page_{idx + 1:04d}.txt")
-        with open(text_path, "w", encoding="utf-8") as f:
-            f.write(text_value or "")
-        raw_frames.append(
-            RawFrame(
-                analysis_index=idx,
-                source_frame_index=int(info["frame_index"]),
-                timestamp_ms=int(info["time_ms"]),
-                image_path=image_path,
-                ocr_text=text_value,
-            )
-        )
-
-        sel = selection_map.get(idx)
+    for idx, raw in enumerate(raw_frames):
+        sel = selection_map.get(raw.analysis_index)
         if sel is not None:
             result = PageResult(
-                image_path=image_path,
-                timestamp_ms=int(info["time_ms"]),
-                analysis_index=idx,
+                image_path=raw.image_path,
+                timestamp_ms=raw.timestamp_ms,
+                analysis_index=raw.analysis_index,
                 pce_peak_index=int(sel["pce_peak_index"]),
                 score_components=sel["score_components"],
-                warp_applied=warp_applied,
-                quad_points=quad_points,
-                ocr_text=text_value,
+                warp_applied=False,
+                quad_points=None,
+                ocr_text=raw.ocr_text,
             )
             results.append(result)
-            if on_item:
-                on_item(result)
-
-        _write_progress_json(output_dir, video_path, raw_frames, results)
-
         if progress_cb:
-            percent = 60 + int(((idx + 1) / max(1, total)) * 30)
-            progress_cb(percent, f"Extracted {idx + 1}/{total}")
+            percent = 60 + int(((idx + 1) / max(1, len(raw_frames))) * 30)
+            progress_cb(percent, f"Prepared {idx + 1}/{len(raw_frames)}")
 
-    cap.release()
+    if on_item:
+        for raw in raw_frames:
+            on_item(
+                PageItem(
+                    image_path=raw.image_path,
+                    timestamp_ms=raw.timestamp_ms,
+                    analysis_index=raw.analysis_index,
+                    is_selected=raw.analysis_index in selection_map,
+                    ocr_text=raw.ocr_text,
+                )
+            )
+
+    _write_progress_json(output_dir, video_path, raw_frames, results)
     if progress_cb:
         progress_cb(95, "Finalizing")
 

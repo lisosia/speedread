@@ -7,7 +7,7 @@ import cv2
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .extractor import ExtractParams, extract_highres_frame, extract_pages
-from .models import PageResult, RawFrame
+from .models import PageItem, RawFrame
 
 
 class ExtractWorker(QtCore.QObject):
@@ -62,6 +62,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._extract_worker: Optional[ExtractWorker] = None
         self._raw_frames: List[RawFrame] = []
         self._preview_time_s = 1.0
+        self._page_item_map: Dict[int, QtWidgets.QListWidgetItem] = {}
 
         self._preset_map = self._build_presets()
 
@@ -244,13 +245,18 @@ class MainWindow(QtWidgets.QMainWindow):
         thumb_layout.setSpacing(6)
 
         self.thumb_list = QtWidgets.QListWidget()
-        self.thumb_list.setViewMode(QtWidgets.QListView.IconMode)
-        self.thumb_list.setIconSize(QtCore.QSize(160, 220))
+        self.thumb_list.setViewMode(QtWidgets.QListView.ListMode)
+        self.thumb_list.setIconSize(QtCore.QSize(72, 100))
         self.thumb_list.setResizeMode(QtWidgets.QListView.Adjust)
-        self.thumb_list.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
+        self.thumb_list.setDragDropMode(QtWidgets.QAbstractItemView.NoDragDrop)
+        self.thumb_list.setDragEnabled(False)
+        self.thumb_list.setAcceptDrops(False)
+        self.thumb_list.setDefaultDropAction(QtCore.Qt.IgnoreAction)
+        self.thumb_list.setMovement(QtWidgets.QListView.Static)
+        self.thumb_list.setWrapping(False)
+        self.thumb_list.setUniformItemSizes(True)
         self.thumb_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.thumb_list.setSpacing(8)
-        self.thumb_list.model().rowsMoved.connect(self._refresh_item_labels)
+        self.thumb_list.setSpacing(6)
         self.thumb_list.itemSelectionChanged.connect(self._update_transcript_view)
 
         thumb_layout.addLayout(header_layout)
@@ -367,7 +373,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setText(message)
         self._log(message)
 
-    def _on_item_ready(self, item: PageResult) -> None:
+    def _on_item_ready(self, item: PageItem) -> None:
         self._add_page_item(item)
 
     def _on_extract_finished(
@@ -389,7 +395,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._output_dir = output_dir
         self.open_folder_btn.setEnabled(self._output_dir is not None)
 
-    def _add_page_item(self, item: PageResult) -> None:
+    def _add_page_item(self, item: PageItem) -> None:
         pixmap = QtGui.QPixmap(item.image_path)
         if not pixmap.isNull():
             pixmap = pixmap.scaled(
@@ -398,16 +404,33 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtCore.Qt.SmoothTransformation,
             )
 
+        existing = self._page_item_map.get(item.analysis_index)
+        if existing is not None:
+            if not pixmap.isNull():
+                existing.setIcon(QtGui.QIcon(pixmap))
+            existing.setData(QtCore.Qt.UserRole, item)
+            self._apply_page_item_style(existing, item)
+            self._refresh_item_labels()
+            if existing.isSelected():
+                self._update_transcript_view()
+            return
+
         list_item = QtWidgets.QListWidgetItem()
         list_item.setIcon(QtGui.QIcon(pixmap))
-        timestamp_sec = item.timestamp_ms / 1000.0
-        list_item.setText(f"{self.thumb_list.count() + 1:04d}\n{timestamp_sec:.2f}s")
         list_item.setData(QtCore.Qt.UserRole, item)
+        self._apply_page_item_style(list_item, item)
         self.thumb_list.addItem(list_item)
+        self._page_item_map[item.analysis_index] = list_item
         self._refresh_item_labels()
 
     def _update_page_count(self) -> None:
         self.page_count_label.setText(f"Pages: {self.thumb_list.count()}")
+
+    def _apply_page_item_style(self, list_item: QtWidgets.QListWidgetItem, item: PageItem) -> None:
+        if item.is_selected is False:
+            list_item.setForeground(QtGui.QColor(140, 140, 140))
+        else:
+            list_item.setForeground(self.thumb_list.palette().brush(QtGui.QPalette.Text))
 
     def _reset_results(self) -> None:
         self.thumb_list.clear()
@@ -419,6 +442,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transcript_view.clear()
         self._refresh_preview()
         self._output_dir = None
+        self._page_item_map = {}
         if hasattr(self, "open_folder_btn"):
             self.open_folder_btn.setEnabled(False)
 
@@ -479,11 +503,13 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(self.thumb_list.count()):
             item = self.thumb_list.item(i)
             data = item.data(QtCore.Qt.UserRole)
-            if isinstance(data, PageResult):
+            if isinstance(data, PageItem):
                 timestamp_sec = data.timestamp_ms / 1000.0
+                suffix = "" if data.is_selected is not False else "  dup"
             else:
                 timestamp_sec = 0.0
-            item.setText(f"{i + 1:04d}\n{timestamp_sec:.2f}s")
+                suffix = ""
+            item.setText(f"{i + 1:04d}  {timestamp_sec:.2f}s{suffix}")
         self._update_page_count()
 
     def _open_output_folder(self) -> None:
@@ -509,8 +535,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.transcript_view.setPlainText("Multiple pages selected.")
             return
         data = items[0].data(QtCore.Qt.UserRole)
-        if isinstance(data, PageResult) and data.ocr_text:
-            self.transcript_view.setPlainText(data.ocr_text)
+        if isinstance(data, PageItem):
+            if data.ocr_text is None:
+                self.transcript_view.setPlainText("Transcription pending.")
+            elif data.ocr_text:
+                self.transcript_view.setPlainText(data.ocr_text)
+            else:
+                self.transcript_view.setPlainText("(No transcription)")
         else:
             self.transcript_view.setPlainText("(No transcription)")
 

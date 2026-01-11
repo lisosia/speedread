@@ -5,6 +5,15 @@ from typing import Dict, List, Optional
 
 
 @dataclass
+class PageItem:
+    image_path: str
+    timestamp_ms: int
+    analysis_index: int
+    is_selected: Optional[bool] = None
+    ocr_text: Optional[str] = None
+
+
+@dataclass
 class PageResult:
     image_path: str
     timestamp_ms: int
