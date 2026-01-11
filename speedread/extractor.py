@@ -21,7 +21,7 @@ from .prompts import get_prompt
 
 @dataclass
 class ExtractParams:
-    analysis_fps: float = 1.0
+    analysis_interval_s: float = 1.0
     analysis_long_side: int = 0
     rotation_degrees: int = 0
     max_interval_s: float = 5.0
@@ -58,6 +58,15 @@ def _safe_fps(raw_fps: float) -> float:
     return raw_fps
 
 
+def _analysis_fps_from_interval(interval_s: float) -> float:
+    safe_interval = max(0.01, float(interval_s))
+    return 1.0 / safe_interval
+
+
+def _analysis_step(fps: float, interval_s: float) -> int:
+    return max(1, int(round(fps * max(0.01, float(interval_s)))))
+
+
 def _resize_long_side(frame: np.ndarray, long_side: int) -> np.ndarray:
     if long_side <= 0:
         return frame
@@ -86,7 +95,7 @@ def rotate_frame(frame: np.ndarray, rotation_degrees: int) -> np.ndarray:
 
 def decode_analysis_frames(
     video_path: str,
-    analysis_fps: float,
+    analysis_interval_s: float,
     long_side: int,
     rotation_degrees: int = 0,
     progress_cb: Optional[Callable[[int, str], None]] = None,
@@ -102,8 +111,7 @@ def decode_analysis_frames(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     video_info = VideoInfo(width=width, height=height, fps=fps, frame_count=frame_count)
 
-    safe_analysis_fps = max(0.01, float(analysis_fps))
-    step = max(1, int(round(fps / safe_analysis_fps)))
+    step = _analysis_step(fps, analysis_interval_s)
     frames: List[np.ndarray] = []
     infos: List[Dict[str, int]] = []
 
@@ -709,7 +717,9 @@ def select_frames(
     if not peaks:
         return selections
 
-    search_end_frames = max(1, int(round(params.search_end_s * params.analysis_fps)))
+    search_end_frames = max(
+        1, int(round(params.search_end_s / max(0.01, params.analysis_interval_s)))
+    )
 
     for peak in peaks:
         start = min(peak + params.search_start_frames, len(frames) - 1)
@@ -1016,7 +1026,7 @@ def extract_pages(
             progress_cb(5, "Decoding analysis frames")
         _frames, infos, _video_info = decode_analysis_frames(
             video_path,
-            params.analysis_fps,
+            params.analysis_interval_s,
             params.analysis_long_side,
             rotation_degrees=params.rotation_degrees,
             progress_cb=progress_cb,
@@ -1160,7 +1170,7 @@ def extract_pages(
             change_raw.append(1.0 - sim)
         change_smooth = _smooth_series(change_raw, window=5)
 
-        fps = max(0.01, float(params.analysis_fps))
+        fps = _analysis_fps_from_interval(params.analysis_interval_s)
         n_trans_min = 1
         n_trans_max = max(1, int(round(params.max_interval_s * fps)))
         boundaries = segment_by_two_refs_texts(

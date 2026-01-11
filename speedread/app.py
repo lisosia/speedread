@@ -75,25 +75,25 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_presets(self) -> Dict[str, ExtractParams]:
         return {
             "UltraFast": ExtractParams(
-                analysis_fps=0.33,
+                analysis_interval_s=3.0,
                 analysis_long_side=0,
                 max_interval_s=5.0,
                 llm_max_tokens=256,
             ),
             "Fast": ExtractParams(
-                analysis_fps=0.5,
+                analysis_interval_s=2.0,
                 analysis_long_side=0,
                 max_interval_s=5.0,
                 llm_max_tokens=384,
             ),
             "Balanced": ExtractParams(
-                analysis_fps=1.0,
+                analysis_interval_s=1.0,
                 analysis_long_side=0,
                 max_interval_s=5.0,
                 llm_max_tokens=512,
             ),
             "Robust": ExtractParams(
-                analysis_fps=2.0,
+                analysis_interval_s=0.5,
                 analysis_long_side=0,
                 max_interval_s=5.0,
                 llm_max_tokens=1024,
@@ -168,9 +168,9 @@ class MainWindow(QtWidgets.QMainWindow):
         advanced_group = QtWidgets.QGroupBox("Extraction")
         advanced_layout = QtWidgets.QFormLayout(advanced_group)
 
-        self.analysis_fps_spin = QtWidgets.QDoubleSpinBox()
-        self.analysis_fps_spin.setRange(0.1, 30.0)
-        self.analysis_fps_spin.setSingleStep(0.1)
+        self.analysis_interval_spin = QtWidgets.QDoubleSpinBox()
+        self.analysis_interval_spin.setRange(0.1, 10.0)
+        self.analysis_interval_spin.setSingleStep(0.1)
         self.analysis_long_side_combo = QtWidgets.QComboBox()
         self.analysis_long_side_combo.addItem("No resize", 0)
         self.analysis_long_side_combo.addItem("1920", 1920)
@@ -197,7 +197,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.llm_max_tokens_spin.setRange(64, 4096)
         self.llm_max_tokens_spin.setSingleStep(64)
 
-        advanced_layout.addRow("Base FPS", self.analysis_fps_spin)
+        advanced_layout.addRow("Base interval (s)", self.analysis_interval_spin)
         advanced_layout.addRow("Analysis long side", self.analysis_long_side_combo)
         advanced_layout.addRow("Max interval (s)", self.max_interval_spin)
         advanced_layout.addRow("Rotation", self.rotation_combo)
@@ -311,7 +311,7 @@ class MainWindow(QtWidgets.QMainWindow):
         params = self._preset_map.get(name)
         if not params:
             return
-        self.analysis_fps_spin.setValue(params.analysis_fps)
+        self.analysis_interval_spin.setValue(params.analysis_interval_s)
         self._set_analysis_long_side(params.analysis_long_side)
         self.max_interval_spin.setValue(params.max_interval_s)
         self.llm_max_tokens_spin.setValue(params.llm_max_tokens)
@@ -326,7 +326,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not prompt_key:
             prompt_key = "general"
         return ExtractParams(
-            analysis_fps=self.analysis_fps_spin.value(),
+            analysis_interval_s=self.analysis_interval_spin.value(),
             analysis_long_side=int(self.analysis_long_side_combo.currentData() or 0),
             rotation_degrees=int(rotation_value),
             max_interval_s=self.max_interval_spin.value(),
@@ -406,7 +406,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _write_session(self, output_dir: str, params: ExtractParams) -> None:
         data = {
             "video_path": self._video_path,
-            "analysis_fps": params.analysis_fps,
+            "base_interval_s": params.analysis_interval_s,
         }
         path = os.path.join(output_dir, "session.json")
         with open(path, "w", encoding="utf-8") as f:
@@ -448,11 +448,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._video_path
             ):
                 output_dir = self._output_dir
-                analysis_fps = session.get("analysis_fps") if isinstance(session, dict) else None
-                if analysis_fps is not None:
+                base_interval = (
+                    session.get("base_interval_s") if isinstance(session, dict) else None
+                )
+                if base_interval is None and isinstance(session, dict):
+                    analysis_fps = session.get("analysis_fps")
+                    if analysis_fps:
+                        base_interval = 1.0 / float(analysis_fps)
+                if base_interval is not None:
                     try:
-                        self.analysis_fps_spin.setValue(float(analysis_fps))
-                    except (TypeError, ValueError):
+                        self.analysis_interval_spin.setValue(float(base_interval))
+                    except (TypeError, ValueError, ZeroDivisionError):
                         pass
         if output_dir is None:
             output_dir = self._create_output_dir()
@@ -518,11 +524,15 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         self._set_video(str(video_path))
-        analysis_fps = session.get("analysis_fps") if isinstance(session, dict) else None
-        if analysis_fps is not None:
+        base_interval = session.get("base_interval_s") if isinstance(session, dict) else None
+        if base_interval is None and isinstance(session, dict):
+            analysis_fps = session.get("analysis_fps")
+            if analysis_fps:
+                base_interval = 1.0 / float(analysis_fps)
+        if base_interval is not None:
             try:
-                self.analysis_fps_spin.setValue(float(analysis_fps))
-            except (TypeError, ValueError):
+                self.analysis_interval_spin.setValue(float(base_interval))
+            except (TypeError, ValueError, ZeroDivisionError):
                 pass
 
         self._reset_results()
