@@ -174,9 +174,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preset_combo.setCurrentText("Balanced")
         self.preset_combo.currentTextChanged.connect(self._apply_preset)
         options_layout.addRow("Preset", self.preset_combo)
-        self.llm_split_check = QtWidgets.QCheckBox("LLM split into 4 (vertical only)")
-        self.llm_split_check.setChecked(True)
-        options_layout.addRow("LLM split", self.llm_split_check)
 
         self.analysis_interval_spin = QtWidgets.QDoubleSpinBox()
         self.analysis_interval_spin.setRange(0.1, 10.0)
@@ -208,9 +205,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.llm_max_tokens_spin.setSingleStep(64)
 
         options_layout.addRow("Base interval (s)", self.analysis_interval_spin)
-        options_layout.addRow("Analysis long side", self.analysis_long_side_combo)
         options_layout.addRow("Max interval (s)", self.max_interval_spin)
         options_layout.addRow("Rotation", self.rotation_combo)
+        options_layout.addRow("Analysis long side", self.analysis_long_side_combo)
+        self.llm_split_check = QtWidgets.QCheckBox("(vertical only; 4 parts for LLM)")
+        self.llm_split_check.setChecked(True)
+        options_layout.addRow("Split pages", self.llm_split_check)
         options_layout.addRow("LLM base URL", self.llm_url_edit)
         options_layout.addRow("LLM model", self.llm_model_edit)
         options_layout.addRow("Prompt", self.llm_prompt_combo)
