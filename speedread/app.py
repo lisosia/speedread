@@ -1,19 +1,12 @@
 from __future__ import annotations
 
 import os
-import tempfile
 from typing import Dict, List, Optional
 
 import cv2
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .extractor import (
-    ExtractParams,
-    extract_highres_frame,
-    extract_pages,
-    extract_single_frame,
-    export_results,
-)
+from .extractor import ExtractParams, extract_highres_frame, extract_pages
 from .models import PageResult, RawFrame
 
 
@@ -22,11 +15,11 @@ class ExtractWorker(QtCore.QObject):
     item_ready = QtCore.Signal(object)
     finished = QtCore.Signal(bool, str, str, object)
 
-    def __init__(self, video_path: str, params: ExtractParams, work_dir: str):
+    def __init__(self, video_path: str, params: ExtractParams, output_dir: str):
         super().__init__()
         self._video_path = video_path
         self._params = params
-        self._work_dir = work_dir
+        self._output_dir = output_dir
         self._stop = False
 
     def stop(self) -> None:
@@ -40,20 +33,20 @@ class ExtractWorker(QtCore.QObject):
             return self._stop
 
         try:
-            work_dir, _results, raw_frames = extract_pages(
+            output_dir, _results, raw_frames = extract_pages(
                 self._video_path,
                 self._params,
-                work_dir=self._work_dir,
+                output_dir=self._output_dir,
                 progress_cb=_progress,
                 should_stop=_should_stop,
                 on_item=lambda item: self.item_ready.emit(item),
             )
             if self._stop:
-                self.finished.emit(False, "Canceled", work_dir, raw_frames)
+                self.finished.emit(False, "Canceled", output_dir, raw_frames)
             else:
-                self.finished.emit(True, "Done", work_dir, raw_frames)
+                self.finished.emit(True, "Done", output_dir, raw_frames)
         except Exception as exc:
-            self.finished.emit(False, f"Error: {exc}", self._work_dir, [])
+            self.finished.emit(False, f"Error: {exc}", self._output_dir, [])
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -64,8 +57,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setAcceptDrops(True)
 
         self._video_path: Optional[str] = None
-        self._work_dir: Optional[str] = None
-        self._next_temp_index = 1
+        self._output_dir: Optional[str] = None
         self._extract_thread: Optional[QtCore.QThread] = None
         self._extract_worker: Optional[ExtractWorker] = None
         self._raw_frames: List[RawFrame] = []
@@ -202,19 +194,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn = QtWidgets.QPushButton("Stop")
         self.stop_btn.clicked.connect(self._stop_extract)
         self.stop_btn.setEnabled(False)
-        self.add_btn = QtWidgets.QPushButton("Add frame")
-        self.add_btn.clicked.connect(self._add_frame)
-        self.add_btn.setEnabled(False)
-        self.export_btn = QtWidgets.QPushButton("Export")
-        self.export_btn.clicked.connect(self._export_results)
-        self.export_btn.setEnabled(False)
-        self.export_pdf_check = QtWidgets.QCheckBox("Export PDF")
+        self.open_folder_btn = QtWidgets.QPushButton("Open output folder")
+        self.open_folder_btn.clicked.connect(self._open_output_folder)
+        self.open_folder_btn.setEnabled(False)
 
         actions_layout.addWidget(self.extract_btn)
         actions_layout.addWidget(self.stop_btn)
-        actions_layout.addWidget(self.add_btn)
-        actions_layout.addWidget(self.export_btn)
-        actions_layout.addWidget(self.export_pdf_check)
+        actions_layout.addWidget(self.open_folder_btn)
         actions_layout.addStretch()
         layout.addWidget(actions_group)
 
@@ -249,14 +235,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         header_layout = QtWidgets.QHBoxLayout()
         self.page_count_label = QtWidgets.QLabel("Pages: 0")
-        delete_btn = QtWidgets.QPushButton("Delete")
-        delete_btn.clicked.connect(self._delete_selected)
-        duplicate_btn = QtWidgets.QPushButton("Duplicate")
-        duplicate_btn.clicked.connect(self._duplicate_selected)
         header_layout.addWidget(self.page_count_label)
         header_layout.addStretch()
-        header_layout.addWidget(delete_btn)
-        header_layout.addWidget(duplicate_btn)
 
         self.thumb_container = QtWidgets.QWidget()
         thumb_layout = QtWidgets.QVBoxLayout(self.thumb_container)
@@ -338,7 +318,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_video(self, path: str) -> None:
         self._video_path = path
         self.video_path_edit.setText(path)
-        self.add_btn.setEnabled(True)
         self._log(f"Loaded video: {path}")
         self._refresh_preview()
 
@@ -349,14 +328,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._extract_worker:
             QtWidgets.QMessageBox.warning(self, "Busy", "Extraction is already running")
             return
+        output_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Select output folder")
+        if not output_dir:
+            return
+        if os.path.exists(output_dir) and os.listdir(output_dir):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Output folder not empty",
+                "Please choose an empty folder for output.",
+            )
+            return
 
         self._reset_results()
-        self._work_dir = tempfile.mkdtemp(prefix="speedread_")
-        self._next_temp_index = 1
+        self._output_dir = output_dir
 
         params = self._collect_params()
         self._extract_thread = QtCore.QThread()
-        self._extract_worker = ExtractWorker(self._video_path, params, self._work_dir)
+        self._extract_worker = ExtractWorker(self._video_path, params, self._output_dir)
         self._extract_worker.moveToThread(self._extract_thread)
 
         self._extract_thread.started.connect(self._extract_worker.run)
@@ -367,8 +355,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.extract_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.export_btn.setEnabled(False)
-        self.add_btn.setEnabled(False)
+        self.open_folder_btn.setEnabled(True)
 
     def _stop_extract(self) -> None:
         if self._extract_worker:
@@ -381,11 +368,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(message)
 
     def _on_item_ready(self, item: PageResult) -> None:
-        self._next_temp_index += 1
         self._add_page_item(item)
 
     def _on_extract_finished(
-        self, success: bool, message: str, work_dir: str, raw_frames: object
+        self, success: bool, message: str, output_dir: str, raw_frames: object
     ) -> None:
         self.progress_bar.setValue(100 if success else self.progress_bar.value())
         self.status_label.setText(message)
@@ -400,9 +386,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._raw_frames = raw_frames if isinstance(raw_frames, list) else []
         self.extract_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.export_btn.setEnabled(self.thumb_list.count() > 0 or len(self._raw_frames) > 0)
-        self.add_btn.setEnabled(True)
-        self._work_dir = work_dir
+        self._output_dir = output_dir
+        self.open_folder_btn.setEnabled(self._output_dir is not None)
 
     def _add_page_item(self, item: PageResult) -> None:
         pixmap = QtGui.QPixmap(item.image_path)
@@ -433,6 +418,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._raw_frames = []
         self.transcript_view.clear()
         self._refresh_preview()
+        self._output_dir = None
+        if hasattr(self, "open_folder_btn"):
+            self.open_folder_btn.setEnabled(False)
 
     def _refresh_preview(self, *args: object) -> None:
         if not self._video_path:
@@ -498,89 +486,19 @@ class MainWindow(QtWidgets.QMainWindow):
             item.setText(f"{i + 1:04d}\n{timestamp_sec:.2f}s")
         self._update_page_count()
 
-    def _delete_selected(self) -> None:
-        for item in self.thumb_list.selectedItems():
-            self.thumb_list.takeItem(self.thumb_list.row(item))
-        self._refresh_item_labels()
-        self._update_transcript_view()
-
-    def _duplicate_selected(self) -> None:
-        items = self.thumb_list.selectedItems()
-        for item in items:
-            data = item.data(QtCore.Qt.UserRole)
-            if not isinstance(data, PageResult):
-                continue
-            dup_item = QtWidgets.QListWidgetItem()
-            dup_item.setIcon(item.icon())
-            dup_item.setText(item.text())
-            dup_item.setData(QtCore.Qt.UserRole, data)
-            self.thumb_list.addItem(dup_item)
-        self._refresh_item_labels()
-        self._update_transcript_view()
-
-    def _add_frame(self) -> None:
-        if not self._video_path:
-            QtWidgets.QMessageBox.warning(self, "No video", "Please select a video file")
-            return
-        if not self._work_dir:
-            self._work_dir = tempfile.mkdtemp(prefix="speedread_")
-
-        seconds, ok = QtWidgets.QInputDialog.getDouble(
-            self, "Add frame", "Timestamp (seconds)", 0.0, 0.0, 10_000.0, 2
-        )
-        if not ok:
-            return
-
-        params = self._collect_params()
-        try:
-            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-            result = extract_single_frame(
-                self._video_path,
-                int(seconds * 1000),
-                params,
-                self._work_dir,
-                self._next_temp_index,
+    def _open_output_folder(self) -> None:
+        if not self._output_dir or not os.path.isdir(self._output_dir):
+            QtWidgets.QMessageBox.warning(
+                self, "Output folder missing", "Please run extraction first."
             )
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to add frame: {exc}")
             return
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
-
-        self._next_temp_index += 1
-        self._add_page_item(result)
-        self.export_btn.setEnabled(True)
-        self._update_transcript_view()
-
-    def _export_results(self) -> None:
-        if not self._video_path:
-            return
-        if self.thumb_list.count() == 0 and not self._raw_frames:
-            QtWidgets.QMessageBox.warning(self, "No pages", "No extracted pages to export")
-            return
-
-        output_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Select output folder")
-        if not output_dir:
-            return
-
-        results = []
-        for i in range(self.thumb_list.count()):
-            item = self.thumb_list.item(i)
-            data = item.data(QtCore.Qt.UserRole)
-            if isinstance(data, PageResult):
-                results.append(data)
-
-        ok, message = export_results(
-            results,
-            output_dir,
-            source_video_path=self._video_path,
-            export_pdf=self.export_pdf_check.isChecked(),
-            raw_frames=self._raw_frames,
+        ok = QtGui.QDesktopServices.openUrl(
+            QtCore.QUrl.fromLocalFile(self._output_dir)
         )
         if not ok:
-            QtWidgets.QMessageBox.warning(self, "Export", message)
-        else:
-            QtWidgets.QMessageBox.information(self, "Export", message)
+            QtWidgets.QMessageBox.warning(
+                self, "Open folder", "Failed to open the output folder."
+            )
 
     def _update_transcript_view(self) -> None:
         items = self.thumb_list.selectedItems()

@@ -613,19 +613,91 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def _add_sim_prev(raw_items: List[Dict[str, object]]) -> None:
+    prev_norm: Optional[str] = None
+    for item in raw_items:
+        text_value = item.get("ocr_text") or ""
+        norm = _normalize_text(text_value) if text_value else ""
+        if prev_norm is None:
+            item["sim_prev"] = None
+        else:
+            item["sim_prev"] = _text_similarity(norm, prev_norm)
+        prev_norm = norm
+
+
+def _write_json_payloads(
+    output_dir: str,
+    source_video_path: str,
+    raw_items: List[Dict[str, object]],
+    selected_items: List[Dict[str, object]],
+) -> None:
+    raw_payload = {"source_video_path": source_video_path, "items": raw_items}
+    selected_payload = {"source_video_path": source_video_path, "items": selected_items}
+    with open(os.path.join(output_dir, "pages_raw.json"), "w", encoding="utf-8") as f:
+        json.dump(raw_payload, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(output_dir, "pages_selected.json"), "w", encoding="utf-8") as f:
+        json.dump(selected_payload, f, ensure_ascii=False, indent=2)
+
+
+def _write_progress_json(
+    output_dir: str,
+    source_video_path: str,
+    raw_frames: List[RawFrame],
+    results: List[PageResult],
+) -> None:
+    raw_items: List[Dict[str, object]] = []
+    raw_index_map: Dict[int, Dict[str, object]] = {}
+    for idx, raw in enumerate(raw_frames, start=1):
+        rel_image = os.path.relpath(raw.image_path, output_dir)
+        entry = {
+            "raw_index": idx,
+            "analysis_index": raw.analysis_index,
+            "source_frame_index": raw.source_frame_index,
+            "timestamp_ms": raw.timestamp_ms,
+            "image": rel_image,
+            "ocr_text": raw.ocr_text,
+        }
+        raw_items.append(entry)
+        raw_index_map[raw.analysis_index] = entry
+
+    _add_sim_prev(raw_items)
+
+    selected_items: List[Dict[str, object]] = []
+    for idx, result in enumerate(results, start=1):
+        image_entry = raw_index_map.get(result.analysis_index)
+        if image_entry is None:
+            rel_image = os.path.relpath(result.image_path, output_dir)
+        else:
+            rel_image = image_entry["image"]
+        selected_items.append(
+            {
+                "selected_index": idx,
+                "analysis_index": result.analysis_index,
+                "timestamp_ms": result.timestamp_ms,
+                "image": rel_image,
+                "ocr_text": result.ocr_text,
+                "score_components": result.score_components,
+                "warp_applied": result.warp_applied,
+                "quad_points": result.quad_points,
+            }
+        )
+
+    _write_json_payloads(output_dir, source_video_path, raw_items, selected_items)
+
+
 def extract_pages(
     video_path: str,
     params: ExtractParams,
-    work_dir: Optional[str] = None,
+    output_dir: Optional[str] = None,
     progress_cb: Optional[Callable[[int, str], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
     on_item: Optional[Callable[[PageResult], None]] = None,
 ) -> Tuple[str, List[PageResult], List[RawFrame]]:
-    if work_dir is None:
-        work_dir = tempfile.mkdtemp(prefix="speedread_")
+    if output_dir is None:
+        output_dir = tempfile.mkdtemp(prefix="speedread_")
 
-    ensure_dir(work_dir)
-    pages_dir = os.path.join(work_dir, "pages_tmp")
+    ensure_dir(output_dir)
+    pages_dir = os.path.join(output_dir, "pages")
     ensure_dir(pages_dir)
 
     if progress_cb:
@@ -640,7 +712,7 @@ def extract_pages(
     )
 
     if should_stop and should_stop():
-        return work_dir, [], []
+        return output_dir, [], []
 
     if progress_cb:
         progress_cb(20, "Running local LLM transcription (hi-res)")
@@ -653,7 +725,7 @@ def extract_pages(
     )
 
     if should_stop and should_stop():
-        return work_dir, [], []
+        return output_dir, [], []
 
     fps = max(0.01, float(params.analysis_fps))
     n_trans_min = 1
@@ -728,10 +800,13 @@ def extract_pages(
         warp_applied = False
 
 
-        image_path = os.path.join(pages_dir, f"frame_{idx + 1:04d}.png")
+        image_path = os.path.join(pages_dir, f"page_{idx + 1:04d}.png")
         cv2.imwrite(image_path, frame)
 
         text_value = texts[idx] if idx < len(texts) else None
+        text_path = os.path.join(pages_dir, f"page_{idx + 1:04d}.txt")
+        with open(text_path, "w", encoding="utf-8") as f:
+            f.write(text_value or "")
         raw_frames.append(
             RawFrame(
                 analysis_index=idx,
@@ -758,6 +833,8 @@ def extract_pages(
             if on_item:
                 on_item(result)
 
+        _write_progress_json(output_dir, video_path, raw_frames, results)
+
         if progress_cb:
             percent = 60 + int(((idx + 1) / max(1, total)) * 30)
             progress_cb(percent, f"Extracted {idx + 1}/{total}")
@@ -766,18 +843,18 @@ def extract_pages(
     if progress_cb:
         progress_cb(95, "Finalizing")
 
-    return work_dir, results, raw_frames
+    return output_dir, results, raw_frames
 
 
 def extract_single_frame(
     video_path: str,
     time_ms: int,
     params: ExtractParams,
-    work_dir: str,
+    output_dir: str,
     index: int,
 ) -> PageResult:
-    ensure_dir(work_dir)
-    pages_dir = os.path.join(work_dir, "pages_tmp")
+    ensure_dir(output_dir)
+    pages_dir = os.path.join(output_dir, "pages")
     ensure_dir(pages_dir)
 
     cap = cv2.VideoCapture(video_path)
@@ -821,9 +898,10 @@ def export_results(
     if raw_frames:
         for idx, raw in enumerate(raw_frames, start=1):
             dst_image = os.path.join(pages_dir, f"page_{idx:04d}.png")
-            with open(raw.image_path, "rb") as src_f:
-                with open(dst_image, "wb") as dst_f:
-                    dst_f.write(src_f.read())
+            if os.path.abspath(raw.image_path) != os.path.abspath(dst_image):
+                with open(raw.image_path, "rb") as src_f:
+                    with open(dst_image, "wb") as dst_f:
+                        dst_f.write(src_f.read())
             output_images.append(dst_image)
             rel_image = os.path.relpath(dst_image, output_dir)
             entry = {
@@ -839,40 +917,34 @@ def export_results(
     else:
         for idx, result in enumerate(results, start=1):
             dst_image = os.path.join(pages_dir, f"page_{idx:04d}.png")
-            with open(result.image_path, "rb") as src_f:
-                with open(dst_image, "wb") as dst_f:
-                    dst_f.write(src_f.read())
+            if os.path.abspath(result.image_path) != os.path.abspath(dst_image):
+                with open(result.image_path, "rb") as src_f:
+                    with open(dst_image, "wb") as dst_f:
+                        dst_f.write(src_f.read())
             output_images.append(dst_image)
             rel_image = os.path.relpath(dst_image, output_dir)
-            raw_items.append(
-                {
-                    "raw_index": idx,
-                    "analysis_index": result.analysis_index,
-                    "source_frame_index": -1,
-                    "timestamp_ms": result.timestamp_ms,
-                    "image": rel_image,
-                    "ocr_text": result.ocr_text,
-                }
-            )
+            entry = {
+                "raw_index": idx,
+                "analysis_index": result.analysis_index,
+                "source_frame_index": -1,
+                "timestamp_ms": result.timestamp_ms,
+                "image": rel_image,
+                "ocr_text": result.ocr_text,
+            }
+            raw_items.append(entry)
+            raw_index_map[result.analysis_index] = entry
 
-    prev_norm: Optional[str] = None
-    for item in raw_items:
-        text_value = item.get("ocr_text") or ""
-        norm = _normalize_text(text_value) if text_value else ""
-        if prev_norm is None:
-            item["sim_prev"] = None
-        else:
-            item["sim_prev"] = _text_similarity(norm, prev_norm)
-        prev_norm = norm
+    _add_sim_prev(raw_items)
 
     next_image_index = len(output_images) + 1
     for idx, result in enumerate(results, start=1):
         image_entry = raw_index_map.get(result.analysis_index)
         if image_entry is None:
             dst_image = os.path.join(pages_dir, f"page_{next_image_index:04d}.png")
-            with open(result.image_path, "rb") as src_f:
-                with open(dst_image, "wb") as dst_f:
-                    dst_f.write(src_f.read())
+            if os.path.abspath(result.image_path) != os.path.abspath(dst_image):
+                with open(result.image_path, "rb") as src_f:
+                    with open(dst_image, "wb") as dst_f:
+                        dst_f.write(src_f.read())
             output_images.append(dst_image)
             image_entry = {"image": os.path.relpath(dst_image, output_dir)}
             next_image_index += 1
@@ -889,12 +961,7 @@ def export_results(
             }
         )
 
-    raw_payload = {"source_video_path": source_video_path, "items": raw_items}
-    selected_payload = {"source_video_path": source_video_path, "items": selected_items}
-    with open(os.path.join(output_dir, "pages_raw.json"), "w", encoding="utf-8") as f:
-        json.dump(raw_payload, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(output_dir, "pages_selected.json"), "w", encoding="utf-8") as f:
-        json.dump(selected_payload, f, ensure_ascii=False, indent=2)
+    _write_json_payloads(output_dir, source_video_path, raw_items, selected_items)
 
     if export_pdf:
         try:
