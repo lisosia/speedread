@@ -170,6 +170,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.llm_prompt_combo.addItem("General", "general")
         self.llm_prompt_combo.addItem("Japanese", "ja")
         self.llm_prompt_combo.addItem("Japanese (vertical)", "ja_vert")
+        self.llm_max_tokens_spin = QtWidgets.QSpinBox()
+        self.llm_max_tokens_spin.setRange(64, 4096)
+        self.llm_max_tokens_spin.setSingleStep(64)
 
         advanced_layout.addRow("Base FPS", self.analysis_fps_spin)
         advanced_layout.addRow("Analysis long side", self.analysis_long_side_combo)
@@ -178,6 +181,7 @@ class MainWindow(QtWidgets.QMainWindow):
         advanced_layout.addRow("LLM base URL", self.llm_url_edit)
         advanced_layout.addRow("LLM model", self.llm_model_edit)
         advanced_layout.addRow("Prompt", self.llm_prompt_combo)
+        advanced_layout.addRow("Max tokens", self.llm_max_tokens_spin)
 
         layout.addWidget(advanced_group)
 
@@ -254,6 +258,11 @@ class MainWindow(QtWidgets.QMainWindow):
         header_layout.addWidget(delete_btn)
         header_layout.addWidget(duplicate_btn)
 
+        self.thumb_container = QtWidgets.QWidget()
+        thumb_layout = QtWidgets.QVBoxLayout(self.thumb_container)
+        thumb_layout.setContentsMargins(0, 0, 0, 0)
+        thumb_layout.setSpacing(6)
+
         self.thumb_list = QtWidgets.QListWidget()
         self.thumb_list.setViewMode(QtWidgets.QListView.IconMode)
         self.thumb_list.setIconSize(QtCore.QSize(160, 220))
@@ -262,9 +271,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thumb_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.thumb_list.setSpacing(8)
         self.thumb_list.model().rowsMoved.connect(self._refresh_item_labels)
+        self.thumb_list.itemSelectionChanged.connect(self._update_transcript_view)
 
-        layout.addLayout(header_layout)
-        layout.addWidget(self.thumb_list, 1)
+        thumb_layout.addLayout(header_layout)
+        thumb_layout.addWidget(self.thumb_list, 1)
+
+        transcript_group = QtWidgets.QGroupBox("Transcription")
+        transcript_layout = QtWidgets.QVBoxLayout(transcript_group)
+        self.transcript_view = QtWidgets.QTextEdit()
+        self.transcript_view.setReadOnly(True)
+        transcript_layout.addWidget(self.transcript_view)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        splitter.addWidget(self.thumb_container)
+        splitter.addWidget(transcript_group)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+
+        layout.addWidget(splitter, 1)
         return widget
 
     def _apply_preset(self, name: str) -> None:
@@ -274,6 +298,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.analysis_fps_spin.setValue(params.analysis_fps)
         self._set_analysis_long_side(params.analysis_long_side)
         self.max_interval_spin.setValue(params.max_interval_s)
+        self.llm_max_tokens_spin.setValue(params.llm_max_tokens)
 
     def _collect_params(self) -> ExtractParams:
         rotation_value = self.rotation_combo.currentData()
@@ -293,6 +318,7 @@ class MainWindow(QtWidgets.QMainWindow):
             llm_model=llm_model,
             llm_prompt_key=str(prompt_key),
             llm_split_4=self.llm_split_check.isChecked(),
+            llm_max_tokens=self.llm_max_tokens_spin.value(),
         )
 
     def _set_analysis_long_side(self, value: int) -> None:
@@ -405,6 +431,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setText("Idle")
         self.log_view.clear()
         self._raw_frames = []
+        self.transcript_view.clear()
         self._refresh_preview()
 
     def _refresh_preview(self, *args: object) -> None:
@@ -475,6 +502,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for item in self.thumb_list.selectedItems():
             self.thumb_list.takeItem(self.thumb_list.row(item))
         self._refresh_item_labels()
+        self._update_transcript_view()
 
     def _duplicate_selected(self) -> None:
         items = self.thumb_list.selectedItems()
@@ -488,6 +516,7 @@ class MainWindow(QtWidgets.QMainWindow):
             dup_item.setData(QtCore.Qt.UserRole, data)
             self.thumb_list.addItem(dup_item)
         self._refresh_item_labels()
+        self._update_transcript_view()
 
     def _add_frame(self) -> None:
         if not self._video_path:
@@ -521,6 +550,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._next_temp_index += 1
         self._add_page_item(result)
         self.export_btn.setEnabled(True)
+        self._update_transcript_view()
 
     def _export_results(self) -> None:
         if not self._video_path:
@@ -551,6 +581,20 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Export", message)
         else:
             QtWidgets.QMessageBox.information(self, "Export", message)
+
+    def _update_transcript_view(self) -> None:
+        items = self.thumb_list.selectedItems()
+        if not items:
+            self.transcript_view.clear()
+            return
+        if len(items) > 1:
+            self.transcript_view.setPlainText("Multiple pages selected.")
+            return
+        data = items[0].data(QtCore.Qt.UserRole)
+        if isinstance(data, PageResult) and data.ocr_text:
+            self.transcript_view.setPlainText(data.ocr_text)
+        else:
+            self.transcript_view.setPlainText("(No transcription)")
 
     def _log(self, message: str) -> None:
         self.log_view.append(message)

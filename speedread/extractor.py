@@ -30,6 +30,7 @@ class ExtractParams:
     llm_timeout_s: int = 180
     llm_prompt_key: str = "general"
     llm_split_4: bool = True
+    llm_max_tokens: int = 1024
     or_window: int = 6
     min_peak_distance_s: float = 0.12
     peak_mad_k: float = 3.0
@@ -326,7 +327,7 @@ def _split_frame_quadrants(frame: np.ndarray) -> List[np.ndarray]:
     ]
 
 
-def _transcribe_frame_once(frame: np.ndarray, params: ExtractParams) -> str:
+def _prepare_llm_payload(frame: np.ndarray, params: ExtractParams, max_tokens: int) -> Dict[str, object]:
     if frame.ndim == 2:
         bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     else:
@@ -335,11 +336,10 @@ def _transcribe_frame_once(frame: np.ndarray, params: ExtractParams) -> str:
     if not ok:
         raise RuntimeError("Failed to encode frame for LLM")
     image_b64 = base64.b64encode(buffer.tobytes()).decode("ascii")
-
     prompt = get_prompt(params.llm_prompt_key)
-    payload = {
+    return {
         "model": params.llm_model,
-        "max_tokens": 1024,
+        "max_tokens": max_tokens,
         "temperature": 0.7,
         "messages": [
             {
@@ -355,7 +355,14 @@ def _transcribe_frame_once(frame: np.ndarray, params: ExtractParams) -> str:
         ],
     }
 
-    response = _llm_request(params.llm_base_url, payload, params.llm_timeout_s)
+
+def _llm_max_tokens(params: ExtractParams, split: bool) -> int:
+    if split:
+        return max(64, int(params.llm_max_tokens // 4))
+    return int(params.llm_max_tokens)
+
+
+def _parse_llm_response(response: Dict[str, object]) -> str:
     content = ""
     try:
         message = response["choices"][0]["message"]["content"]
@@ -370,16 +377,21 @@ def _transcribe_frame_once(frame: np.ndarray, params: ExtractParams) -> str:
     return content.strip()
 
 
+def _transcribe_frame_once(frame: np.ndarray, params: ExtractParams, max_tokens: int) -> str:
+    payload = _prepare_llm_payload(frame, params, max_tokens)
+    response = _llm_request(params.llm_base_url, payload, params.llm_timeout_s)
+    return _parse_llm_response(response)
+
+
 def transcribe_frame(frame: np.ndarray, params: ExtractParams) -> str:
-    if not params.llm_split_4:
-        return _transcribe_frame_once(frame, params)
+    should_split = params.llm_split_4 and "vert" in params.llm_prompt_key
+    if not should_split:
+        max_tokens = _llm_max_tokens(params, split=False)
+        return _transcribe_frame_once(frame, params, max_tokens)
 
-    is_vertical = "vert" in params.llm_prompt_key
-    if not is_vertical:
-        return _transcribe_frame_once(frame, params)
-
+    max_tokens = _llm_max_tokens(params, split=True)
     parts = _split_frame_vertical(frame)
-    texts = [_transcribe_frame_once(part, params) for part in parts]
+    texts = [_transcribe_frame_once(part, params, max_tokens) for part in parts]
     return "\n\n\n".join(texts).strip()
 
 
@@ -911,6 +923,7 @@ if __name__ == "__main__":
     parser.add_argument("--base-url", default="http://127.0.0.1:1234", help="LLM base URL")
     parser.add_argument("--model", default="qwen/qwen3-vl-8b", help="LLM model name")
     parser.add_argument("--timeout", type=int, default=60, help="Request timeout in seconds")
+    parser.add_argument("--max-tokens", type=int, default=1024, help="Max tokens per request")
     parser.add_argument(
         "--prompt",
         default="general",
@@ -924,6 +937,7 @@ if __name__ == "__main__":
         llm_model=args.model,
         llm_timeout_s=args.timeout,
         llm_prompt_key=args.prompt,
+        llm_max_tokens=args.max_tokens,
     )
 
     try:
