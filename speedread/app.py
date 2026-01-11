@@ -73,20 +73,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_presets(self) -> Dict[str, ExtractParams]:
         return {
-            "Fast": ExtractParams(
-                analysis_fps=1.0,
+            "UltraFast": ExtractParams(
+                analysis_fps=0.33,
                 analysis_long_side=0,
                 max_interval_s=5.0,
+                llm_max_tokens=256,
+            ),
+            "Fast": ExtractParams(
+                analysis_fps=0.5,
+                analysis_long_side=0,
+                max_interval_s=5.0,
+                llm_max_tokens=384,
             ),
             "Balanced": ExtractParams(
                 analysis_fps=1.0,
                 analysis_long_side=0,
                 max_interval_s=5.0,
+                llm_max_tokens=512,
             ),
             "Robust": ExtractParams(
-                analysis_fps=1.0,
+                analysis_fps=2.0,
                 analysis_long_side=0,
                 max_interval_s=5.0,
+                llm_max_tokens=1024,
             ),
         }
 
@@ -133,6 +142,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preset_combo = QtWidgets.QComboBox()
         for name in self._preset_map.keys():
             self.preset_combo.addItem(name)
+        self.preset_combo.setCurrentText("Balanced")
         self.preset_combo.currentTextChanged.connect(self._apply_preset)
         preset_layout.addWidget(preset_label)
         preset_layout.addWidget(self.preset_combo, 1)
