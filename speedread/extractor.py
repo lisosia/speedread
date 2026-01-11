@@ -377,6 +377,76 @@ def _parse_llm_response(response: Dict[str, object]) -> str:
     return content.strip()
 
 
+def _approx_tokens(text: str) -> int:
+    return max(1, len(text))
+
+
+def _chunk_texts(texts: List[str], max_tokens: int) -> List[str]:
+    chunks: List[str] = []
+    current: List[str] = []
+    current_tokens = 0
+    for text in texts:
+        if not text:
+            continue
+        token_count = _approx_tokens(text)
+        if current and current_tokens + token_count > max_tokens:
+            chunks.append("\n\n".join(current).strip())
+            current = []
+            current_tokens = 0
+        current.append(text)
+        current_tokens += token_count
+    if current:
+        chunks.append("\n\n".join(current).strip())
+    return chunks
+
+
+def _prepare_summary_payload(text: str, params: ExtractParams, max_tokens: int) -> Dict[str, object]:
+    prompt = (
+        "Summarize the following text concisely in the same language as the input. "
+        "Keep key facts/opinions and remove useless details.\n\n"
+    )
+    return {
+        "model": params.llm_model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt + text,
+            }
+        ],
+        "max_tokens": max_tokens,
+    }
+
+
+def _summarize_chunk(text: str, params: ExtractParams, max_tokens: int) -> str:
+    payload = _prepare_summary_payload(text, params, max_tokens)
+    response = _llm_request(params.llm_base_url, payload, params.llm_timeout_s)
+    return _parse_llm_response(response)
+
+
+def _summarize_recursive(
+    texts: List[str],
+    params: ExtractParams,
+    max_input_tokens: int,
+    max_output_tokens: int,
+    summarize_fn: Optional[Callable[[str], str]] = None,
+) -> str:
+    current_texts = [t for t in texts if t]
+    if not current_texts:
+        return ""
+    if summarize_fn is None:
+        summarize_fn = lambda chunk: _summarize_chunk(chunk, params, max_output_tokens)
+    while True:
+        prev_total = sum(_approx_tokens(t) for t in current_texts)
+        chunks = _chunk_texts(current_texts, max_input_tokens)
+        summaries = [summarize_fn(chunk) for chunk in chunks]
+        if len(summaries) <= 1:
+            return summaries[0] if summaries else ""
+        summary_total = sum(_approx_tokens(t) for t in summaries)
+        if summary_total >= prev_total and len(summaries) == len(current_texts):
+            return "\n\n".join(summaries).strip()
+        current_texts = summaries
+
+
 def _transcribe_frame_once(frame: np.ndarray, params: ExtractParams, max_tokens: int) -> str:
     payload = _prepare_llm_payload(frame, params, max_tokens)
     response = _llm_request(params.llm_base_url, payload, params.llm_timeout_s)
@@ -888,7 +958,26 @@ def extract_pages(
 
     _write_progress_json(output_dir, video_path, raw_frames, results)
     if progress_cb:
-        progress_cb(95, "Finalizing")
+        progress_cb(96, "Summarizing")
+
+    summary_text = ""
+    try:
+        summary_inputs = [r.ocr_text or "" for r in results]
+        summary_text = _summarize_recursive(
+            summary_inputs,
+            params,
+            max_input_tokens=20000,
+            max_output_tokens=int(params.llm_max_tokens),
+        )
+    except Exception as exc:
+        summary_text = f"Summary failed: {exc}"
+
+    if output_dir:
+        summary_path = os.path.join(output_dir, "final_summary.txt")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write(summary_text)
+    if progress_cb:
+        progress_cb(98, "Finalizing")
 
     return output_dir, results, raw_frames
 
