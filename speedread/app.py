@@ -2,18 +2,25 @@ from __future__ import annotations
 
 import os
 import tempfile
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
+import cv2
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .extractor import ExtractParams, extract_pages, extract_single_frame, export_results
-from .models import PageResult
+from .extractor import (
+    ExtractParams,
+    extract_highres_frame,
+    extract_pages,
+    extract_single_frame,
+    export_results,
+)
+from .models import PageResult, RawFrame
 
 
 class ExtractWorker(QtCore.QObject):
     progress = QtCore.Signal(int, str)
     item_ready = QtCore.Signal(object)
-    finished = QtCore.Signal(bool, str, str)
+    finished = QtCore.Signal(bool, str, str, object)
 
     def __init__(self, video_path: str, params: ExtractParams, work_dir: str):
         super().__init__()
@@ -33,7 +40,7 @@ class ExtractWorker(QtCore.QObject):
             return self._stop
 
         try:
-            work_dir, _results = extract_pages(
+            work_dir, _results, raw_frames = extract_pages(
                 self._video_path,
                 self._params,
                 work_dir=self._work_dir,
@@ -42,11 +49,11 @@ class ExtractWorker(QtCore.QObject):
                 on_item=lambda item: self.item_ready.emit(item),
             )
             if self._stop:
-                self.finished.emit(False, "Canceled", work_dir)
+                self.finished.emit(False, "Canceled", work_dir, raw_frames)
             else:
-                self.finished.emit(True, "Done", work_dir)
+                self.finished.emit(True, "Done", work_dir, raw_frames)
         except Exception as exc:
-            self.finished.emit(False, f"Error: {exc}", self._work_dir)
+            self.finished.emit(False, f"Error: {exc}", self._work_dir, [])
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -61,6 +68,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._next_temp_index = 1
         self._extract_thread: Optional[QtCore.QThread] = None
         self._extract_worker: Optional[ExtractWorker] = None
+        self._raw_frames: List[RawFrame] = []
+        self._preview_time_s = 1.0
 
         self._preset_map = self._build_presets()
 
@@ -69,22 +78,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_presets(self) -> Dict[str, ExtractParams]:
         return {
             "Fast": ExtractParams(
-                analysis_fps=8,
-                analysis_long_side=480,
-                min_interval_s=0.1,
-                max_interval_s=2.5,
+                analysis_fps=1.0,
+                analysis_long_side=0,
+                max_interval_s=5.0,
             ),
             "Balanced": ExtractParams(
-                analysis_fps=10,
-                analysis_long_side=640,
-                min_interval_s=0.1,
-                max_interval_s=3.0,
+                analysis_fps=1.0,
+                analysis_long_side=0,
+                max_interval_s=5.0,
             ),
             "Robust": ExtractParams(
-                analysis_fps=12,
-                analysis_long_side=720,
-                min_interval_s=0.1,
-                max_interval_s=3.0,
+                analysis_fps=1.0,
+                analysis_long_side=0,
+                max_interval_s=5.0,
             ),
         }
 
@@ -131,34 +137,32 @@ class MainWindow(QtWidgets.QMainWindow):
 
         options_group = QtWidgets.QGroupBox("Options")
         options_layout = QtWidgets.QVBoxLayout(options_group)
-        self.enable_warp_check = QtWidgets.QCheckBox("Try perspective warp")
-        self.enable_warp_check.setChecked(True)
-        self.center_crop_check = QtWidgets.QCheckBox("Center crop fallback")
-        options_layout.addWidget(self.enable_warp_check)
-        options_layout.addWidget(self.center_crop_check)
+        self.llm_split_check = QtWidgets.QCheckBox("LLM split into 4 (vertical only)")
+        self.llm_split_check.setChecked(True)
+        options_layout.addWidget(self.llm_split_check)
         layout.addWidget(options_group)
 
         advanced_group = QtWidgets.QGroupBox("Extraction")
         advanced_layout = QtWidgets.QFormLayout(advanced_group)
 
-        self.analysis_fps_spin = QtWidgets.QSpinBox()
-        self.analysis_fps_spin.setRange(1, 30)
-        self.analysis_long_side_spin = QtWidgets.QSpinBox()
-        self.analysis_long_side_spin.setRange(320, 1280)
-        self.min_interval_spin = QtWidgets.QDoubleSpinBox()
-        self.min_interval_spin.setRange(0.1, 3.0)
-        self.min_interval_spin.setSingleStep(0.1)
+        self.analysis_fps_spin = QtWidgets.QDoubleSpinBox()
+        self.analysis_fps_spin.setRange(0.1, 30.0)
+        self.analysis_fps_spin.setSingleStep(0.1)
+        self.analysis_long_side_combo = QtWidgets.QComboBox()
+        self.analysis_long_side_combo.addItem("No resize", 0)
+        self.analysis_long_side_combo.addItem("1920", 1920)
+        self.analysis_long_side_combo.addItem("1280", 1280)
+        self.analysis_long_side_combo.addItem("720", 720)
         self.max_interval_spin = QtWidgets.QDoubleSpinBox()
-        self.max_interval_spin.setRange(0.1, 3.0)
+        self.max_interval_spin.setRange(0.1, 10.0)
         self.max_interval_spin.setSingleStep(0.1)
-        self.min_interval_spin.valueChanged.connect(self._sync_interval_limits)
-        self.max_interval_spin.valueChanged.connect(self._sync_interval_limits)
 
         self.rotation_combo = QtWidgets.QComboBox()
         self.rotation_combo.addItem("0 deg", 0)
         self.rotation_combo.addItem("90 deg", 90)
         self.rotation_combo.addItem("180 deg", 180)
         self.rotation_combo.addItem("270 deg", 270)
+        self.rotation_combo.currentIndexChanged.connect(self._refresh_preview)
 
         self.llm_url_edit = QtWidgets.QLineEdit("http://127.0.0.1:1234")
         self.llm_model_edit = QtWidgets.QLineEdit("qwen/qwen3-vl-8b")
@@ -168,8 +172,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.llm_prompt_combo.addItem("Japanese (vertical)", "ja_vert")
 
         advanced_layout.addRow("Base FPS", self.analysis_fps_spin)
-        advanced_layout.addRow("Analysis long side", self.analysis_long_side_spin)
-        advanced_layout.addRow("Min interval (s)", self.min_interval_spin)
+        advanced_layout.addRow("Analysis long side", self.analysis_long_side_combo)
         advanced_layout.addRow("Max interval (s)", self.max_interval_spin)
         advanced_layout.addRow("Rotation", self.rotation_combo)
         advanced_layout.addRow("LLM base URL", self.llm_url_edit)
@@ -177,6 +180,16 @@ class MainWindow(QtWidgets.QMainWindow):
         advanced_layout.addRow("Prompt", self.llm_prompt_combo)
 
         layout.addWidget(advanced_group)
+
+        preview_group = QtWidgets.QGroupBox("Preview")
+        preview_layout = QtWidgets.QVBoxLayout(preview_group)
+        self.preview_label = QtWidgets.QLabel("No preview")
+        self.preview_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.preview_label.setMinimumSize(200, 260)
+        self.preview_label.setFrameShape(QtWidgets.QFrame.Box)
+        self.preview_label.setFrameShadow(QtWidgets.QFrame.Sunken)
+        preview_layout.addWidget(self.preview_label)
+        layout.addWidget(preview_group)
 
         actions_group = QtWidgets.QGroupBox("Actions")
         actions_layout = QtWidgets.QVBoxLayout(actions_group)
@@ -259,8 +272,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not params:
             return
         self.analysis_fps_spin.setValue(params.analysis_fps)
-        self.analysis_long_side_spin.setValue(params.analysis_long_side)
-        self.min_interval_spin.setValue(params.min_interval_s)
+        self._set_analysis_long_side(params.analysis_long_side)
         self.max_interval_spin.setValue(params.max_interval_s)
 
     def _collect_params(self) -> ExtractParams:
@@ -274,22 +286,21 @@ class MainWindow(QtWidgets.QMainWindow):
             prompt_key = "general"
         return ExtractParams(
             analysis_fps=self.analysis_fps_spin.value(),
-            analysis_long_side=self.analysis_long_side_spin.value(),
+            analysis_long_side=int(self.analysis_long_side_combo.currentData() or 0),
             rotation_degrees=int(rotation_value),
-            min_interval_s=self.min_interval_spin.value(),
             max_interval_s=self.max_interval_spin.value(),
             llm_base_url=llm_url,
             llm_model=llm_model,
             llm_prompt_key=str(prompt_key),
-            enable_warp=self.enable_warp_check.isChecked(),
-            use_center_crop_fallback=self.center_crop_check.isChecked(),
+            llm_split_4=self.llm_split_check.isChecked(),
         )
 
-    def _sync_interval_limits(self) -> None:
-        min_val = self.min_interval_spin.value()
-        max_val = self.max_interval_spin.value()
-        if min_val > max_val:
-            self.max_interval_spin.setValue(min_val)
+    def _set_analysis_long_side(self, value: int) -> None:
+        for i in range(self.analysis_long_side_combo.count()):
+            if int(self.analysis_long_side_combo.itemData(i)) == int(value):
+                self.analysis_long_side_combo.setCurrentIndex(i)
+                return
+        self.analysis_long_side_combo.setCurrentIndex(0)
 
     def _browse_video(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -303,6 +314,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.video_path_edit.setText(path)
         self.add_btn.setEnabled(True)
         self._log(f"Loaded video: {path}")
+        self._refresh_preview()
 
     def _start_extract(self) -> None:
         if not self._video_path:
@@ -346,7 +358,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._next_temp_index += 1
         self._add_page_item(item)
 
-    def _on_extract_finished(self, success: bool, message: str, work_dir: str) -> None:
+    def _on_extract_finished(
+        self, success: bool, message: str, work_dir: str, raw_frames: object
+    ) -> None:
         self.progress_bar.setValue(100 if success else self.progress_bar.value())
         self.status_label.setText(message)
         self._log(message)
@@ -357,9 +371,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._extract_thread = None
         self._extract_worker = None
 
+        self._raw_frames = raw_frames if isinstance(raw_frames, list) else []
         self.extract_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.export_btn.setEnabled(self.thumb_list.count() > 0)
+        self.export_btn.setEnabled(self.thumb_list.count() > 0 or len(self._raw_frames) > 0)
         self.add_btn.setEnabled(True)
         self._work_dir = work_dir
 
@@ -389,6 +404,61 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress_bar.setValue(0)
         self.status_label.setText("Idle")
         self.log_view.clear()
+        self._raw_frames = []
+        self._refresh_preview()
+
+    def _refresh_preview(self, *args: object) -> None:
+        if not self._video_path:
+            self.preview_label.setText("No preview")
+            self.preview_label.setPixmap(QtGui.QPixmap())
+            return
+
+        rotation_value = self.rotation_combo.currentData()
+        if rotation_value is None:
+            rotation_value = 0
+
+        cap = cv2.VideoCapture(self._video_path)
+        if not cap.isOpened():
+            self.preview_label.setText("Preview unavailable")
+            self.preview_label.setPixmap(QtGui.QPixmap())
+            return
+
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS))
+            frame_count = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration_s = frame_count / fps if fps > 0 else 0.0
+            preview_time = self._preview_time_s
+            if duration_s and duration_s < preview_time:
+                preview_time = max(0.0, duration_s / 2.0)
+            frame = extract_highres_frame(
+                cap,
+                time_ms=int(preview_time * 1000),
+                rotation_degrees=int(rotation_value),
+            )
+        except Exception:
+            self.preview_label.setText("Preview unavailable")
+            self.preview_label.setPixmap(QtGui.QPixmap())
+            return
+        finally:
+            cap.release()
+
+        if frame is None:
+            self.preview_label.setText("Preview unavailable")
+            self.preview_label.setPixmap(QtGui.QPixmap())
+            return
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        image = QtGui.QImage(rgb.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888).copy()
+        pixmap = QtGui.QPixmap.fromImage(image)
+        pixmap = pixmap.scaled(
+            self.preview_label.size(),
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
+        self.preview_label.setText("")
+        self.preview_label.setPixmap(pixmap)
 
     def _refresh_item_labels(self, *args: object) -> None:
         for i in range(self.thumb_list.count()):
@@ -455,7 +525,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _export_results(self) -> None:
         if not self._video_path:
             return
-        if self.thumb_list.count() == 0:
+        if self.thumb_list.count() == 0 and not self._raw_frames:
             QtWidgets.QMessageBox.warning(self, "No pages", "No extracted pages to export")
             return
 
@@ -475,6 +545,7 @@ class MainWindow(QtWidgets.QMainWindow):
             output_dir,
             source_video_path=self._video_path,
             export_pdf=self.export_pdf_check.isChecked(),
+            raw_frames=self._raw_frames,
         )
         if not ok:
             QtWidgets.QMessageBox.warning(self, "Export", message)

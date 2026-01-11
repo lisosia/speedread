@@ -14,6 +14,12 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## Tests
+
+```bash
+pytest
+```
+
 ## Notes
 
 - Exported assets are written to the selected output folder under `pages/`.

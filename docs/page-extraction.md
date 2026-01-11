@@ -17,10 +17,10 @@ This pipeline prioritizes page text consistency over motion peaks. It samples fr
 ### Steps
 
 1. User selects rotation (0/90/180/270) before extraction.
-2. Sample the video at base FPS (default 10 fps) and downscale for LLM transcription.
-3. Run per-frame transcription using the local LLM (LM Studio).
-4. Compute text similarity between consecutive frames and derive a text-change series.
-5. Segment the timeline using robust stats (median + MAD) and enforce min/max extraction intervals.
+2. Sample the video at base FPS (default 1 fps) for segmentation.
+3. Run per-frame transcription using the local LLM (LM Studio) on high-res frames.
+4. Compute text similarity between frames (sim(i,j)) from transcriptions.
+5. Segment the timeline using the two-reference method (jump search + |g(t)| minimum) with min/max intervals.
 6. For each segment, pick the middle frame as the representative page.
 7. Decode the high-res frame, apply rotation and optional perspective warp, and export.
 
@@ -29,9 +29,8 @@ Each exported page JSON includes the transcription text captured for the selecte
 ### Parameters
 
 - Rotation: 0/90/180/270 degrees (user selection in GUI)
-- Base FPS: default 10 fps
-- Min interval: 0.1 sec
-- Max interval: 3.0 sec
+- Base FPS: default 1 fps
+- Max interval: 5.0 sec
 - LLM base URL and model (default LM Studio endpoint and `qwen/qwen3-vl-8b`)
 
 ### Requirements

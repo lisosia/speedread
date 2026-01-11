@@ -15,21 +15,21 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from .models import PageResult
+from .models import PageResult, RawFrame
 from .prompts import get_prompt
 
 
 @dataclass
 class ExtractParams:
-    analysis_fps: int = 10
-    analysis_long_side: int = 640
+    analysis_fps: float = 1.0
+    analysis_long_side: int = 0
     rotation_degrees: int = 0
-    min_interval_s: float = 0.1
-    max_interval_s: float = 3.0
+    max_interval_s: float = 5.0
     llm_base_url: str = "http://127.0.0.1:1234"
     llm_model: str = "qwen/qwen3-vl-8b"
-    llm_timeout_s: int = 60
+    llm_timeout_s: int = 180
     llm_prompt_key: str = "general"
+    llm_split_4: bool = True
     or_window: int = 6
     min_peak_distance_s: float = 0.12
     peak_mad_k: float = 3.0
@@ -39,8 +39,6 @@ class ExtractParams:
     search_end_s: float = 0.4
     output_per_peak: int = 1
     use_quad_in_score: bool = False
-    enable_warp: bool = True
-    use_center_crop_fallback: bool = False
     motion_weight: float = 0.7
     quad_weight: float = 0.15
 
@@ -60,6 +58,8 @@ def _safe_fps(raw_fps: float) -> float:
 
 
 def _resize_long_side(frame: np.ndarray, long_side: int) -> np.ndarray:
+    if long_side <= 0:
+        return frame
     h, w = frame.shape[:2]
     if max(h, w) <= long_side:
         return frame
@@ -85,7 +85,7 @@ def rotate_frame(frame: np.ndarray, rotation_degrees: int) -> np.ndarray:
 
 def decode_analysis_frames(
     video_path: str,
-    analysis_fps: int,
+    analysis_fps: float,
     long_side: int,
     rotation_degrees: int = 0,
     progress_cb: Optional[Callable[[int, str], None]] = None,
@@ -101,7 +101,8 @@ def decode_analysis_frames(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     video_info = VideoInfo(width=width, height=height, fps=fps, frame_count=frame_count)
 
-    step = max(1, int(round(fps / float(analysis_fps))))
+    safe_analysis_fps = max(0.01, float(analysis_fps))
+    step = max(1, int(round(fps / safe_analysis_fps)))
     frames: List[np.ndarray] = []
     infos: List[Dict[str, int]] = []
 
@@ -300,8 +301,32 @@ def _text_similarity(a: str, b: str) -> float:
         return 0.0
     return difflib.SequenceMatcher(None, a, b).ratio()
 
+def _split_frame_vertical(frame: np.ndarray, parts: int = 4, right_to_left: bool = True) -> List[np.ndarray]:
+    h, w = frame.shape[:2]
+    if parts <= 1 or w <= 1:
+        return [frame]
+    boundaries = [int(round(i * w / parts)) for i in range(parts + 1)]
+    slices = [frame[:, boundaries[i] : boundaries[i + 1]] for i in range(parts)]
+    if right_to_left:
+        slices.reverse()
+    return slices
 
-def transcribe_frame(frame: np.ndarray, params: ExtractParams) -> str:
+
+def _split_frame_quadrants(frame: np.ndarray) -> List[np.ndarray]:
+    h, w = frame.shape[:2]
+    if h <= 1 or w <= 1:
+        return [frame]
+    mid_h = h // 2
+    mid_w = w // 2
+    return [
+        frame[0:mid_h, 0:mid_w],
+        frame[0:mid_h, mid_w:w],
+        frame[mid_h:h, 0:mid_w],
+        frame[mid_h:h, mid_w:w],
+    ]
+
+
+def _transcribe_frame_once(frame: np.ndarray, params: ExtractParams) -> str:
     if frame.ndim == 2:
         bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     else:
@@ -314,7 +339,8 @@ def transcribe_frame(frame: np.ndarray, params: ExtractParams) -> str:
     prompt = get_prompt(params.llm_prompt_key)
     payload = {
         "model": params.llm_model,
-        "temperature": 0.1,
+        "max_tokens": 1024,
+        "temperature": 0.7,
         "messages": [
             {
                 "role": "user",
@@ -344,6 +370,19 @@ def transcribe_frame(frame: np.ndarray, params: ExtractParams) -> str:
     return content.strip()
 
 
+def transcribe_frame(frame: np.ndarray, params: ExtractParams) -> str:
+    if not params.llm_split_4:
+        return _transcribe_frame_once(frame, params)
+
+    is_vertical = "vert" in params.llm_prompt_key
+    if not is_vertical:
+        return _transcribe_frame_once(frame, params)
+
+    parts = _split_frame_vertical(frame)
+    texts = [_transcribe_frame_once(part, params) for part in parts]
+    return "\n\n\n".join(texts).strip()
+
+
 def transcribe_image_file(image_path: str, params: ExtractParams) -> str:
     image = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if image is None:
@@ -352,26 +391,40 @@ def transcribe_image_file(image_path: str, params: ExtractParams) -> str:
 
 
 def compute_text_change_series(
-    frames: List[np.ndarray],
+    video_path: str,
+    infos: List[Dict[str, int]],
     params: ExtractParams,
     progress_cb: Optional[Callable[[int, str], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
-) -> Tuple[List[str], List[float], List[float]]:
-    if not frames:
-        return [], [], []
+) -> Tuple[List[str], List[str], List[float], List[float]]:
+    if not infos:
+        return [], [], [], []
 
     texts_raw: List[str] = []
     texts_norm: List[str] = []
-    total = len(frames)
+    total = len(infos)
 
-    for idx, frame in enumerate(frames):
-        if should_stop and should_stop():
-            break
-        text = transcribe_frame(frame, params)
-        texts_raw.append(text.strip())
-        texts_norm.append(_normalize_text(text))
-        if progress_cb and idx % 20 == 0:
-            progress_cb(35, f"LLM {idx + 1}/{total}")
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Failed to open video for LLM transcription")
+
+    try:
+        for idx, info in enumerate(infos):
+            if should_stop and should_stop():
+                break
+            frame = extract_highres_frame(
+                cap,
+                frame_index=info.get("frame_index"),
+                time_ms=info.get("time_ms"),
+                rotation_degrees=params.rotation_degrees,
+            )
+            text = transcribe_frame(frame, params)
+            texts_raw.append(text.strip())
+            texts_norm.append(_normalize_text(text))
+            if progress_cb and idx % 20 == 0:
+                progress_cb(35, f"LLM {idx + 1}/{total}")
+    finally:
+        cap.release()
 
     change_raw = [0.0]
     for i in range(1, len(texts_norm)):
@@ -379,59 +432,95 @@ def compute_text_change_series(
         change_raw.append(1.0 - sim)
 
     change_smooth = _smooth_series(change_raw, window=5)
-    return texts_raw, change_raw, change_smooth
+    return texts_raw, texts_norm, change_raw, change_smooth
 
 
-def segment_by_text_change(
-    times_ms: List[int],
-    change_series: List[float],
-    min_interval_s: float,
-    max_interval_s: float,
-    mad_k: float,
+def segment_by_two_refs(
+    sim: Callable[[int, int], float],
+    n: int,
+    thr: float,
+    n_trans_min: int,
+    n_trans_max: int,
 ) -> List[int]:
-    if not times_ms or not change_series:
+    if n <= 1:
         return []
 
-    min_ms = max(0.0, min_interval_s) * 1000.0
-    max_ms = max(min_ms, max_interval_s) * 1000.0
-    threshold = _auto_threshold(change_series, mad_k)
+    l_step = max(1, n_trans_min // 2)
+    k_confirm = max(1, l_step // 4)
+    m_grid = 16
+    boundaries: List[int] = []
+    p = 0
 
-    boundaries = [0]
-    last_idx = 0
-    candidate_idx: Optional[int] = None
-    candidate_val = -1.0
+    def g(t: int, left: int, right: int) -> float:
+        return sim(t, left) - sim(t, right)
 
-    for i in range(1, len(change_series)):
-        elapsed = times_ms[i] - times_ms[last_idx]
-        value = change_series[i]
+    while True:
+        q = p + l_step
+        if q >= n:
+            break
 
-        if elapsed >= min_ms and value > candidate_val:
-            candidate_val = value
-            candidate_idx = i
+        while q < n and sim(p, q) > thr and (q - p) < n_trans_max:
+            q += l_step
 
-        if elapsed >= min_ms and value >= threshold:
-            if i != last_idx:
-                boundaries.append(i)
-                last_idx = i
-            candidate_idx = None
-            candidate_val = -1.0
-            continue
+        if q >= n:
+            break
 
-        if elapsed >= max_ms:
-            if candidate_idx is None:
-                candidate_idx = i
-            if candidate_idx != last_idx:
-                boundaries.append(candidate_idx)
-                last_idx = candidate_idx
-            candidate_idx = None
-            candidate_val = -1.0
+        forced = False
+        if (q - p) >= n_trans_max and sim(p, q) > thr:
+            q = min(p + n_trans_max, n - 1)
+            forced = True
+        if not forced:
+            while q + k_confirm < n:
+                mx = max(sim(p, q + i) for i in range(k_confirm))
+                if mx <= thr:
+                    break
+                q += 1
+                if (q - p) >= n_trans_max:
+                    q = min(p + n_trans_max, n - 1)
+                    forced = True
+                    break
+
+        if q <= p:
+            break
+
+        best_t = p
+        best_val = float("inf")
+        for i in range(1, m_grid):
+            t = p + (q - p) * i // m_grid
+            val = abs(g(t, p, q))
+            if val < best_val:
+                best_val = val
+                best_t = t
+
+        lo = max(p, best_t - l_step // 8)
+        hi = min(q, best_t + l_step // 8)
+        boundary = best_t
+        best_val = float("inf")
+        for t in range(lo, hi + 1):
+            val = abs(g(t, p, q))
+            if val < best_val:
+                best_val = val
+                boundary = t
+
+        boundaries.append(boundary)
+        p = q
 
     return boundaries
 
 
-def _quick_quad_score(gray: np.ndarray) -> float:
-    quad = detect_page_quad(gray)
-    return 1.0 if quad is not None else 0.0
+def segment_by_two_refs_texts(
+    texts_norm: List[str],
+    thr: float,
+    n_trans_min: int,
+    n_trans_max: int,
+) -> List[int]:
+    return segment_by_two_refs(
+        lambda i, j: _text_similarity(texts_norm[i], texts_norm[j]),
+        len(texts_norm),
+        thr,
+        n_trans_min,
+        n_trans_max,
+    )
 
 
 def select_frames(
@@ -454,23 +543,20 @@ def select_frames(
 
         sharp_vals: List[float] = []
         motion_vals: List[float] = []
-        quad_vals: List[float] = []
         indices = list(range(start, end + 1))
 
         for idx in indices:
             sharp = _laplacian_variance(frames[idx])
             motion = float(motion_series[idx])
-            quad_score = _quick_quad_score(frames[idx]) if params.use_quad_in_score else 0.0
             sharp_vals.append(sharp)
             motion_vals.append(motion)
-            quad_vals.append(quad_score)
 
         sharp_norm = _normalize(sharp_vals)
         motion_norm = _normalize(motion_vals)
 
         scores: List[Tuple[int, float]] = []
         for i, idx in enumerate(indices):
-            score = sharp_norm[i] - params.motion_weight * motion_norm[i] + params.quad_weight * quad_vals[i]
+            score = sharp_norm[i] - params.motion_weight * motion_norm[i]
             scores.append((idx, score))
 
         scores.sort(key=lambda x: x[1], reverse=True)
@@ -483,111 +569,11 @@ def select_frames(
                     "score_components": {
                         "sharpness": float(sharp_vals[i]),
                         "motion": float(motion_vals[i]),
-                        "quad_score": float(quad_vals[i]),
-                    },
-                }
-            )
+                    "quad_score": 0.0,
+                },
+            }
+        )
     return selections
-
-
-def order_points(pts: np.ndarray) -> np.ndarray:
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-
-def detect_page_quad(image: np.ndarray) -> Optional[np.ndarray]:
-    if image is None:
-        return None
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image.copy()
-
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return None
-
-    img_h, img_w = gray.shape[:2]
-    min_area = img_w * img_h * 0.08
-    best = None
-    best_area = 0.0
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < min_area:
-            continue
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-        if len(approx) != 4:
-            continue
-        if not cv2.isContourConvex(approx):
-            continue
-        if area > best_area:
-            best_area = area
-            best = approx
-
-    if best is None:
-        return None
-
-    pts = best.reshape(4, 2).astype("float32")
-    ordered = order_points(pts)
-
-    width_a = np.linalg.norm(ordered[2] - ordered[3])
-    width_b = np.linalg.norm(ordered[1] - ordered[0])
-    height_a = np.linalg.norm(ordered[1] - ordered[2])
-    height_b = np.linalg.norm(ordered[0] - ordered[3])
-
-    width = max(width_a, width_b)
-    height = max(height_a, height_b)
-    if width < img_w * 0.2 or height < img_h * 0.2:
-        return None
-
-    ratio = width / max(height, 1.0)
-    if ratio < 0.4 or ratio > 2.8:
-        return None
-
-    return ordered
-
-
-def warp_perspective(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
-    width_a = np.linalg.norm(quad[2] - quad[3])
-    width_b = np.linalg.norm(quad[1] - quad[0])
-    height_a = np.linalg.norm(quad[1] - quad[2])
-    height_b = np.linalg.norm(quad[0] - quad[3])
-
-    max_width = int(max(width_a, width_b))
-    max_height = int(max(height_a, height_b))
-
-    dst = np.array(
-        [
-            [0, 0],
-            [max_width - 1, 0],
-            [max_width - 1, max_height - 1],
-            [0, max_height - 1],
-        ],
-        dtype="float32",
-    )
-
-    matrix = cv2.getPerspectiveTransform(quad, dst)
-    return cv2.warpPerspective(image, matrix, (max_width, max_height))
-
-
-def center_crop(image: np.ndarray, scale: float = 0.9) -> np.ndarray:
-    h, w = image.shape[:2]
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-    x0 = max(0, (w - new_w) // 2)
-    y0 = max(0, (h - new_h) // 2)
-    return image[y0 : y0 + new_h, x0 : x0 + new_w].copy()
 
 
 def extract_highres_frame(
@@ -622,7 +608,7 @@ def extract_pages(
     progress_cb: Optional[Callable[[int, str], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
     on_item: Optional[Callable[[PageResult], None]] = None,
-) -> Tuple[str, List[PageResult]]:
+) -> Tuple[str, List[PageResult], List[RawFrame]]:
     if work_dir is None:
         work_dir = tempfile.mkdtemp(prefix="speedread_")
 
@@ -642,28 +628,29 @@ def extract_pages(
     )
 
     if should_stop and should_stop():
-        return work_dir, []
+        return work_dir, [], []
 
     if progress_cb:
-        progress_cb(20, "Running local LLM transcription")
-    texts, _change_raw, change_smooth = compute_text_change_series(
-        frames,
+        progress_cb(20, "Running local LLM transcription (hi-res)")
+    texts, texts_norm, _change_raw, change_smooth = compute_text_change_series(
+        video_path,
+        infos,
         params,
         progress_cb=progress_cb,
         should_stop=should_stop,
     )
 
     if should_stop and should_stop():
-        return work_dir, []
+        return work_dir, [], []
 
-    fps = max(1, params.analysis_fps)
-    times_ms = [int(i * (1000.0 / fps)) for i in range(len(frames))]
-    boundaries = segment_by_text_change(
-        times_ms,
-        change_smooth,
-        params.min_interval_s,
-        params.max_interval_s,
-        params.peak_mad_k,
+    fps = max(0.01, float(params.analysis_fps))
+    n_trans_min = 1
+    n_trans_max = max(1, int(round(params.max_interval_s * fps)))
+    boundaries = segment_by_two_refs_texts(
+        texts_norm,
+        thr=0.2,
+        n_trans_min=n_trans_min,
+        n_trans_max=n_trans_max,
     )
 
     if progress_cb:
@@ -672,37 +659,52 @@ def extract_pages(
     selections: List[Dict[str, object]] = []
     if not boundaries:
         if progress_cb:
-            progress_cb(95, "No text segments found")
-        return work_dir, []
+            progress_cb(55, "No text segments found, exporting all frames")
+    else:
+        segment_starts = [0]
+        for boundary in boundaries:
+            if boundary > segment_starts[-1]:
+                segment_starts.append(boundary)
 
-    for idx, start in enumerate(boundaries):
-        end = boundaries[idx + 1] if idx + 1 < len(boundaries) else len(frames)
-        if end <= start:
-            continue
-        mid = start + (end - start) // 2
-        score_val = change_smooth[mid] if mid < len(change_smooth) else 0.0
-        selections.append(
-            {
-                "analysis_index": mid,
-                "pce_peak_index": start,
-                "score_components": {"text_change": float(score_val)},
-            }
-        )
+        expanded_starts = [segment_starts[0]]
+        for idx, start in enumerate(segment_starts):
+            end = segment_starts[idx + 1] if idx + 1 < len(segment_starts) else len(frames)
+            current = start
+            while (end - current) > n_trans_max:
+                current += n_trans_max
+                if current < end:
+                    expanded_starts.append(current)
+        segment_starts = sorted(set(expanded_starts))
+
+        for idx, start in enumerate(segment_starts):
+            end = segment_starts[idx + 1] if idx + 1 < len(segment_starts) else len(frames)
+            if end <= start:
+                continue
+            mid = start + (end - start) // 2
+            score_val = change_smooth[mid] if mid < len(change_smooth) else 0.0
+            selections.append(
+                {
+                    "analysis_index": mid,
+                    "pce_peak_index": start,
+                    "score_components": {"text_change": float(score_val)},
+                }
+            )
 
     if not selections:
         if progress_cb:
-            progress_cb(95, "No frames selected")
-        return work_dir, []
+            progress_cb(55, "No frames selected, exporting all frames")
 
     if progress_cb:
-        progress_cb(60, "Extracting high-res frames")
+        progress_cb(60, "Extracting all frames")
 
+    raw_frames: List[RawFrame] = []
     results: List[PageResult] = []
+    selection_map = {sel["analysis_index"]: sel for sel in selections}
     cap = cv2.VideoCapture(video_path)
-    for idx, sel in enumerate(selections, start=1):
+    total = len(infos)
+    for idx, info in enumerate(infos):
         if should_stop and should_stop():
             break
-        info = infos[sel["analysis_index"]]
         frame = extract_highres_frame(
             cap,
             frame_index=info["frame_index"],
@@ -712,44 +714,47 @@ def extract_pages(
 
         quad_points = None
         warp_applied = False
-        if params.enable_warp:
-            quad = detect_page_quad(frame)
-            if quad is not None:
-                frame = warp_perspective(frame, quad)
-                quad_points = quad.astype(int).tolist()
-                warp_applied = True
 
-        if not warp_applied and params.use_center_crop_fallback:
-            frame = center_crop(frame)
 
-        image_path = os.path.join(pages_dir, f"page_{idx:04d}.png")
+        image_path = os.path.join(pages_dir, f"frame_{idx + 1:04d}.png")
         cv2.imwrite(image_path, frame)
 
-        text_value = None
-        if sel["analysis_index"] < len(texts):
-            text_value = texts[sel["analysis_index"]]
-        result = PageResult(
-            image_path=image_path,
-            timestamp_ms=int(info["time_ms"]),
-            pce_peak_index=int(sel["pce_peak_index"]),
-            score_components=sel["score_components"],
-            warp_applied=warp_applied,
-            quad_points=quad_points,
-            ocr_text=text_value,
+        text_value = texts[idx] if idx < len(texts) else None
+        raw_frames.append(
+            RawFrame(
+                analysis_index=idx,
+                source_frame_index=int(info["frame_index"]),
+                timestamp_ms=int(info["time_ms"]),
+                image_path=image_path,
+                ocr_text=text_value,
+            )
         )
-        results.append(result)
-        if on_item:
-            on_item(result)
+
+        sel = selection_map.get(idx)
+        if sel is not None:
+            result = PageResult(
+                image_path=image_path,
+                timestamp_ms=int(info["time_ms"]),
+                analysis_index=idx,
+                pce_peak_index=int(sel["pce_peak_index"]),
+                score_components=sel["score_components"],
+                warp_applied=warp_applied,
+                quad_points=quad_points,
+                ocr_text=text_value,
+            )
+            results.append(result)
+            if on_item:
+                on_item(result)
 
         if progress_cb:
-            percent = 60 + int((idx / max(1, len(selections))) * 30)
-            progress_cb(percent, f"Extracted {idx}/{len(selections)}")
+            percent = 60 + int(((idx + 1) / max(1, total)) * 30)
+            progress_cb(percent, f"Extracted {idx + 1}/{total}")
 
     cap.release()
     if progress_cb:
         progress_cb(95, "Finalizing")
 
-    return work_dir, results
+    return work_dir, results, raw_frames
 
 
 def extract_single_frame(
@@ -769,15 +774,7 @@ def extract_single_frame(
 
     quad_points = None
     warp_applied = False
-    if params.enable_warp:
-        quad = detect_page_quad(frame)
-        if quad is not None:
-            frame = warp_perspective(frame, quad)
-            quad_points = quad.astype(int).tolist()
-            warp_applied = True
 
-    if not warp_applied and params.use_center_crop_fallback:
-        frame = center_crop(frame)
 
     image_path = os.path.join(pages_dir, f"page_{index:04d}.png")
     cv2.imwrite(image_path, frame)
@@ -785,6 +782,7 @@ def extract_single_frame(
     return PageResult(
         image_path=image_path,
         timestamp_ms=int(time_ms),
+        analysis_index=-1,
         pce_peak_index=-1,
         score_components={"sharpness": 0.0, "motion": 0.0, "quad_score": 0.0},
         warp_applied=warp_applied,
@@ -798,25 +796,93 @@ def export_results(
     output_dir: str,
     source_video_path: str,
     export_pdf: bool = False,
+    raw_frames: Optional[List[RawFrame]] = None,
 ) -> Tuple[bool, str]:
     pages_dir = os.path.join(output_dir, "pages")
     ensure_dir(pages_dir)
 
     output_images: List[str] = []
+    raw_items: List[Dict[str, object]] = []
+    selected_items: List[Dict[str, object]] = []
+    raw_index_map: Dict[int, Dict[str, object]] = {}
 
+    if raw_frames:
+        for idx, raw in enumerate(raw_frames, start=1):
+            dst_image = os.path.join(pages_dir, f"page_{idx:04d}.png")
+            with open(raw.image_path, "rb") as src_f:
+                with open(dst_image, "wb") as dst_f:
+                    dst_f.write(src_f.read())
+            output_images.append(dst_image)
+            rel_image = os.path.relpath(dst_image, output_dir)
+            entry = {
+                "raw_index": idx,
+                "analysis_index": raw.analysis_index,
+                "source_frame_index": raw.source_frame_index,
+                "timestamp_ms": raw.timestamp_ms,
+                "image": rel_image,
+                "ocr_text": raw.ocr_text,
+            }
+            raw_items.append(entry)
+            raw_index_map[raw.analysis_index] = entry
+    else:
+        for idx, result in enumerate(results, start=1):
+            dst_image = os.path.join(pages_dir, f"page_{idx:04d}.png")
+            with open(result.image_path, "rb") as src_f:
+                with open(dst_image, "wb") as dst_f:
+                    dst_f.write(src_f.read())
+            output_images.append(dst_image)
+            rel_image = os.path.relpath(dst_image, output_dir)
+            raw_items.append(
+                {
+                    "raw_index": idx,
+                    "analysis_index": result.analysis_index,
+                    "source_frame_index": -1,
+                    "timestamp_ms": result.timestamp_ms,
+                    "image": rel_image,
+                    "ocr_text": result.ocr_text,
+                }
+            )
+
+    prev_norm: Optional[str] = None
+    for item in raw_items:
+        text_value = item.get("ocr_text") or ""
+        norm = _normalize_text(text_value) if text_value else ""
+        if prev_norm is None:
+            item["sim_prev"] = None
+        else:
+            item["sim_prev"] = _text_similarity(norm, prev_norm)
+        prev_norm = norm
+
+    next_image_index = len(output_images) + 1
     for idx, result in enumerate(results, start=1):
-        dst_image = os.path.join(pages_dir, f"page_{idx:04d}.png")
-        with open(result.image_path, "rb") as src_f:
-            with open(dst_image, "wb") as dst_f:
-                dst_f.write(src_f.read())
-        output_images.append(dst_image)
+        image_entry = raw_index_map.get(result.analysis_index)
+        if image_entry is None:
+            dst_image = os.path.join(pages_dir, f"page_{next_image_index:04d}.png")
+            with open(result.image_path, "rb") as src_f:
+                with open(dst_image, "wb") as dst_f:
+                    dst_f.write(src_f.read())
+            output_images.append(dst_image)
+            image_entry = {"image": os.path.relpath(dst_image, output_dir)}
+            next_image_index += 1
+        selected_items.append(
+            {
+                "selected_index": idx,
+                "analysis_index": result.analysis_index,
+                "timestamp_ms": result.timestamp_ms,
+                "image": image_entry["image"],
+                "ocr_text": result.ocr_text,
+                "score_components": result.score_components,
+                "warp_applied": result.warp_applied,
+                "quad_points": result.quad_points,
+            }
+        )
 
-        meta = result.to_json()
-        meta["page_index"] = idx
-        meta["source_video_path"] = source_video_path
-        dst_json = os.path.join(pages_dir, f"page_{idx:04d}.json")
-        with open(dst_json, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=True, indent=2)
+    raw_payload = {"source_video_path": source_video_path, "items": raw_items}
+    selected_payload = {"source_video_path": source_video_path, "items": selected_items}
+    with open(os.path.join(output_dir, "pages_raw.json"), "w", encoding="utf-8") as f:
+        json.dump(raw_payload, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(output_dir, "pages_selected.json"), "w", encoding="utf-8") as f:
+        json.dump(selected_payload, f, ensure_ascii=False, indent=2)
 
     if export_pdf:
         try:
