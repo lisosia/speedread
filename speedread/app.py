@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from typing import Dict, List, Optional
 
 import cv2
@@ -56,8 +57,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1200, 720)
         self.setAcceptDrops(True)
 
+        self._settings = QtCore.QSettings("speedread", "speedread")
         self._video_path: Optional[str] = None
         self._output_dir: Optional[str] = None
+        self._output_root: Optional[str] = self._load_output_root()
         self._extract_thread: Optional[QtCore.QThread] = None
         self._extract_worker: Optional[ExtractWorker] = None
         self._raw_frames: List[RawFrame] = []
@@ -115,6 +118,15 @@ class MainWindow(QtWidgets.QMainWindow):
         path_layout.addWidget(self.video_path_edit, 1)
         path_layout.addWidget(browse_btn)
         input_layout.addLayout(path_layout)
+
+        output_layout = QtWidgets.QHBoxLayout()
+        self.output_root_label = QtWidgets.QLabel()
+        self._refresh_output_root_label()
+        self.output_root_btn = QtWidgets.QPushButton("Set output root")
+        self.output_root_btn.clicked.connect(self._select_output_root)
+        output_layout.addWidget(self.output_root_label, 1)
+        output_layout.addWidget(self.output_root_btn)
+        input_layout.addLayout(output_layout)
 
         preset_layout = QtWidgets.QHBoxLayout()
         preset_label = QtWidgets.QLabel("Preset")
@@ -327,6 +339,52 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(f"Loaded video: {path}")
         self._refresh_preview()
 
+    def _load_output_root(self) -> Optional[str]:
+        value = self._settings.value("output_root", "", str)
+        return value or None
+
+    def _save_output_root(self, path: str) -> None:
+        self._settings.setValue("output_root", path)
+        self._output_root = path
+        self._refresh_output_root_label()
+
+    def _refresh_output_root_label(self) -> None:
+        if self._output_root:
+            self.output_root_label.setText(f"Output root: {self._output_root}")
+        else:
+            self.output_root_label.setText("Output root: (not set)")
+
+    def _select_output_root(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select output root", self._output_root or ""
+        )
+        if not path:
+            return
+        self._save_output_root(path)
+
+    def _ensure_output_root(self) -> bool:
+        if self._output_root and os.path.isdir(self._output_root):
+            return True
+        self._select_output_root()
+        return bool(self._output_root and os.path.isdir(self._output_root))
+
+    def _create_output_dir(self) -> Optional[str]:
+        if not self._output_root:
+            return None
+        base = os.path.splitext(os.path.basename(self._video_path or "video"))[0]
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = f"{stamp}-{base}"
+        candidate = os.path.join(self._output_root, name)
+        if not os.path.exists(candidate):
+            os.makedirs(candidate, exist_ok=False)
+            return candidate
+        for i in range(1, 100):
+            alt = f"{candidate}-{i}"
+            if not os.path.exists(alt):
+                os.makedirs(alt, exist_ok=False)
+                return alt
+        return None
+
     def _start_extract(self) -> None:
         if not self._video_path:
             QtWidgets.QMessageBox.warning(self, "No video", "Please select a video file")
@@ -334,14 +392,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._extract_worker:
             QtWidgets.QMessageBox.warning(self, "Busy", "Extraction is already running")
             return
-        output_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Select output folder")
-        if not output_dir:
+
+        if not self._ensure_output_root():
             return
-        if os.path.exists(output_dir) and os.listdir(output_dir):
+
+        output_dir = self._create_output_dir()
+        if not output_dir:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Output folder not empty",
-                "Please choose an empty folder for output.",
+                "Output folder unavailable",
+                "Failed to create a new output folder.",
             )
             return
 
