@@ -467,13 +467,26 @@ class MainWindow(QtWidgets.QMainWindow):
             frame_count = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             duration_s = frame_count / fps if fps > 0 else 0.0
             preview_time = self._preview_time_s
-            if duration_s and duration_s < preview_time:
+            if duration_s > 0 and preview_time > duration_s:
                 preview_time = max(0.0, duration_s / 2.0)
-            frame = extract_highres_frame(
-                cap,
-                time_ms=int(preview_time * 1000),
-                rotation_degrees=int(rotation_value),
-            )
+
+            if frame_count > 0:
+                if duration_s > 0:
+                    ratio = min(1.0, preview_time / duration_s)
+                    frame_index = int(round((frame_count - 1) * ratio))
+                else:
+                    frame_index = 0
+                frame = extract_highres_frame(
+                    cap,
+                    frame_index=frame_index,
+                    rotation_degrees=int(rotation_value),
+                )
+            else:
+                frame = extract_highres_frame(
+                    cap,
+                    time_ms=int(preview_time * 1000),
+                    rotation_degrees=int(rotation_value),
+                )
         except Exception:
             self.preview_label.setText("Preview unavailable")
             self.preview_label.setPixmap(QtGui.QPixmap())

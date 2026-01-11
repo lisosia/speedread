@@ -562,6 +562,9 @@ def segment_by_two_refs(
                 best_val = val
                 boundary = t
 
+        if q == p + 1:
+            boundary = q
+
         boundaries.append(boundary)
         p = q
 
@@ -581,6 +584,49 @@ def segment_by_two_refs_texts(
         n_trans_min,
         n_trans_max,
     )
+
+
+def _expand_segment_starts(
+    boundaries: List[int],
+    total: int,
+    n_trans_max: int,
+) -> List[int]:
+    segment_starts = [0]
+    for boundary in boundaries:
+        if boundary > segment_starts[-1]:
+            segment_starts.append(boundary)
+
+    expanded_starts = list(segment_starts)
+    for idx, start in enumerate(segment_starts):
+        end = segment_starts[idx + 1] if idx + 1 < len(segment_starts) else total
+        current = start
+        while (end - current) > n_trans_max:
+            current += n_trans_max
+            if current < end:
+                expanded_starts.append(current)
+
+    return sorted(set(expanded_starts))
+
+
+def _select_analysis_indices(
+    boundaries: List[int],
+    total: int,
+    n_trans_max: int,
+) -> List[int]:
+    if total <= 0:
+        return []
+    if not boundaries:
+        return list(range(total))
+
+    segment_starts = _expand_segment_starts(boundaries, total, n_trans_max)
+    indices: List[int] = []
+    for idx, start in enumerate(segment_starts):
+        end = segment_starts[idx + 1] if idx + 1 < len(segment_starts) else total
+        if end <= start:
+            continue
+        mid = start + (end - start) // 2
+        indices.append(mid)
+    return indices
 
 
 def select_frames(
@@ -648,6 +694,9 @@ def extract_highres_frame(
         cap.set(cv2.CAP_PROP_POS_MSEC, time_ms)
 
     ok, frame = cap.read()
+    if not ok and frame_index is not None:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ok, frame = cap.read()
     if not ok and time_ms is not None:
         cap.set(cv2.CAP_PROP_POS_MSEC, time_ms)
         ok, frame = cap.read()
@@ -788,50 +837,22 @@ def extract_pages(
         progress_cb(50, f"Selecting frames ({len(boundaries)})")
 
     selections: List[Dict[str, object]] = []
-    if not boundaries:
-        if progress_cb:
-            progress_cb(55, "No text segments found, exporting all frames")
-    else:
-        segment_starts = [0]
-        for boundary in boundaries:
-            if boundary > segment_starts[-1]:
-                segment_starts.append(boundary)
+    if not boundaries and progress_cb:
+        progress_cb(55, "No text segments found, exporting all frames")
 
-        expanded_starts = [segment_starts[0]]
-        for idx, start in enumerate(segment_starts):
-            end = (
-                segment_starts[idx + 1]
-                if idx + 1 < len(segment_starts)
-                else len(texts_norm)
-            )
-            current = start
-            while (end - current) > n_trans_max:
-                current += n_trans_max
-                if current < end:
-                    expanded_starts.append(current)
-        segment_starts = sorted(set(expanded_starts))
+    selected_indices = _select_analysis_indices(boundaries, len(texts_norm), n_trans_max)
+    if not selected_indices and progress_cb:
+        progress_cb(55, "No frames selected, exporting all frames")
 
-        for idx, start in enumerate(segment_starts):
-            end = (
-                segment_starts[idx + 1]
-                if idx + 1 < len(segment_starts)
-                else len(texts_norm)
-            )
-            if end <= start:
-                continue
-            mid = start + (end - start) // 2
-            score_val = change_smooth[mid] if mid < len(change_smooth) else 0.0
-            selections.append(
-                {
-                    "analysis_index": mid,
-                    "pce_peak_index": start,
-                    "score_components": {"text_change": float(score_val)},
-                }
-            )
-
-    if not selections:
-        if progress_cb:
-            progress_cb(55, "No frames selected, exporting all frames")
+    for mid in selected_indices:
+        score_val = change_smooth[mid] if mid < len(change_smooth) else 0.0
+        selections.append(
+            {
+                "analysis_index": mid,
+                "pce_peak_index": mid,
+                "score_components": {"text_change": float(score_val)},
+            }
+        )
 
     results: List[PageResult] = []
     selection_map = {sel["analysis_index"]: sel for sel in selections}
