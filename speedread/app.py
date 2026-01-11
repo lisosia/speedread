@@ -109,64 +109,74 @@ class MainWindow(QtWidgets.QMainWindow):
         center_panel = self._build_center_panel()
         right_panel = self._build_right_panel()
 
-        main_layout.addWidget(left_panel, 1)
-        main_layout.addWidget(center_panel, 2)
-        main_layout.addWidget(right_panel, 3)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(left_panel)
+        splitter.addWidget(center_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 3)
+        base_width = max(1, self.width())
+        splitter.setSizes(
+            [
+                int(base_width * 0.2),
+                int(base_width * 0.3),
+                int(base_width * 0.5),
+            ]
+        )
+        main_layout.addWidget(splitter)
 
     def _build_left_panel(self) -> QtWidgets.QWidget:
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
 
         input_group = QtWidgets.QGroupBox("Input")
-        input_layout = QtWidgets.QVBoxLayout(input_group)
+        input_layout = QtWidgets.QFormLayout(input_group)
 
         path_layout = QtWidgets.QHBoxLayout()
         self.video_path_edit = QtWidgets.QLineEdit()
         self.video_path_edit.setReadOnly(True)
-        browse_btn = QtWidgets.QPushButton("Browse")
+        browse_btn = QtWidgets.QPushButton("Select video")
         browse_btn.clicked.connect(self._browse_video)
         path_layout.addWidget(self.video_path_edit, 1)
         path_layout.addWidget(browse_btn)
-        input_layout.addLayout(path_layout)
+        input_layout.addRow("Input video", path_layout)
 
-        output_layout = QtWidgets.QHBoxLayout()
+        layout.addWidget(input_group)
+
+        output_group = QtWidgets.QGroupBox("Output")
+        output_layout = QtWidgets.QVBoxLayout(output_group)
+
+        output_root_layout = QtWidgets.QHBoxLayout()
         self.output_root_label = QtWidgets.QLabel()
         self._refresh_output_root_label()
         self.output_root_btn = QtWidgets.QPushButton("Set output root")
         self.output_root_btn.clicked.connect(self._select_output_root)
-        output_layout.addWidget(self.output_root_label, 1)
-        output_layout.addWidget(self.output_root_btn)
-        input_layout.addLayout(output_layout)
+        output_root_layout.addWidget(self.output_root_label, 1)
+        output_root_layout.addWidget(self.output_root_btn)
+        output_layout.addLayout(output_root_layout)
 
         resume_layout = QtWidgets.QHBoxLayout()
         self.resume_btn = QtWidgets.QPushButton("Resume (select folder)")
         self.resume_btn.clicked.connect(self._resume_extract)
         resume_layout.addStretch()
         resume_layout.addWidget(self.resume_btn)
-        input_layout.addLayout(resume_layout)
+        output_layout.addLayout(resume_layout)
 
-        preset_layout = QtWidgets.QHBoxLayout()
-        preset_label = QtWidgets.QLabel("Preset")
+        layout.addWidget(output_group)
+
+        options_group = QtWidgets.QGroupBox("Options")
+        options_layout = QtWidgets.QFormLayout(options_group)
         self.preset_combo = QtWidgets.QComboBox()
         for name in self._preset_map.keys():
             self.preset_combo.addItem(name)
         self.preset_combo.setCurrentText("Balanced")
         self.preset_combo.currentTextChanged.connect(self._apply_preset)
-        preset_layout.addWidget(preset_label)
-        preset_layout.addWidget(self.preset_combo, 1)
-        input_layout.addLayout(preset_layout)
-
-        layout.addWidget(input_group)
-
-        options_group = QtWidgets.QGroupBox("Options")
-        options_layout = QtWidgets.QVBoxLayout(options_group)
+        options_layout.addRow("Preset", self.preset_combo)
         self.llm_split_check = QtWidgets.QCheckBox("LLM split into 4 (vertical only)")
         self.llm_split_check.setChecked(True)
-        options_layout.addWidget(self.llm_split_check)
-        layout.addWidget(options_group)
-
-        advanced_group = QtWidgets.QGroupBox("Extraction")
-        advanced_layout = QtWidgets.QFormLayout(advanced_group)
+        options_layout.addRow("LLM split", self.llm_split_check)
 
         self.analysis_interval_spin = QtWidgets.QDoubleSpinBox()
         self.analysis_interval_spin.setRange(0.1, 10.0)
@@ -197,16 +207,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.llm_max_tokens_spin.setRange(64, 4096)
         self.llm_max_tokens_spin.setSingleStep(64)
 
-        advanced_layout.addRow("Base interval (s)", self.analysis_interval_spin)
-        advanced_layout.addRow("Analysis long side", self.analysis_long_side_combo)
-        advanced_layout.addRow("Max interval (s)", self.max_interval_spin)
-        advanced_layout.addRow("Rotation", self.rotation_combo)
-        advanced_layout.addRow("LLM base URL", self.llm_url_edit)
-        advanced_layout.addRow("LLM model", self.llm_model_edit)
-        advanced_layout.addRow("Prompt", self.llm_prompt_combo)
-        advanced_layout.addRow("Max tokens", self.llm_max_tokens_spin)
+        options_layout.addRow("Base interval (s)", self.analysis_interval_spin)
+        options_layout.addRow("Analysis long side", self.analysis_long_side_combo)
+        options_layout.addRow("Max interval (s)", self.max_interval_spin)
+        options_layout.addRow("Rotation", self.rotation_combo)
+        options_layout.addRow("LLM base URL", self.llm_url_edit)
+        options_layout.addRow("LLM model", self.llm_model_edit)
+        options_layout.addRow("Prompt", self.llm_prompt_combo)
+        options_layout.addRow("Max tokens", self.llm_max_tokens_spin)
 
-        layout.addWidget(advanced_group)
+        layout.addWidget(options_group)
 
         preview_group = QtWidgets.QGroupBox("Preview")
         preview_layout = QtWidgets.QVBoxLayout(preview_group)
