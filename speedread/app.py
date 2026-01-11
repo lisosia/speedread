@@ -139,7 +139,7 @@ class MainWindow(QtWidgets.QMainWindow):
         input_layout.addLayout(output_layout)
 
         resume_layout = QtWidgets.QHBoxLayout()
-        self.resume_btn = QtWidgets.QPushButton("Resume")
+        self.resume_btn = QtWidgets.QPushButton("Resume (select folder)")
         self.resume_btn.clicked.connect(self._resume_extract)
         resume_layout.addStretch()
         resume_layout.addWidget(self.resume_btn)
