@@ -319,13 +319,13 @@ class MainWindow(QtWidgets.QMainWindow):
         return {
             "UltraFast": ExtractParams(
                 analysis_interval_s=3.0,
-                analysis_long_side=0,
+                analysis_long_side=720,
                 max_interval_s=5.0,
                 llm_max_tokens=256,
             ),
             "Fast": ExtractParams(
                 analysis_interval_s=2.0,
-                analysis_long_side=0,
+                analysis_long_side=1280,
                 max_interval_s=5.0,
                 llm_max_tokens=384,
             ),
