@@ -524,6 +524,8 @@ class MainWindow(QtWidgets.QMainWindow):
         transcript_layout = QtWidgets.QVBoxLayout(transcript_group)
         self.transcript_view = QtWidgets.QTextEdit()
         self.transcript_view.setReadOnly(True)
+        self.transcript_view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.transcript_view.customContextMenuRequested.connect(self._copy_transcription)
         transcript_layout.addWidget(self.transcript_view)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
@@ -984,6 +986,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.transcript_view.setPlainText("(No transcription)")
         else:
             self.transcript_view.setPlainText("(No transcription)")
+
+    def _copy_transcription(self, *args: object) -> None:
+        text = self.transcript_view.toPlainText()
+        if not text:
+            self._log("No transcription to copy.")
+            return
+        QtWidgets.QApplication.clipboard().setText(text)
+        self._log("Transcription copied to clipboard.")
 
     def _log(self, message: str) -> None:
         self.log_view.append(message)
