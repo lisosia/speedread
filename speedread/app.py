@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 from datetime import datetime
 import json
+from functools import partial
+import shutil
 from typing import Dict, List, Optional
 
 import cv2
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .extractor import ExtractParams, extract_highres_frame, extract_pages
+from .extractor import ExtractParams, extract_highres_frame, extract_pages, run_step
 from .models import PageItem, RawFrame
 
 
@@ -235,11 +237,20 @@ class ExtractWorker(QtCore.QObject):
     item_ready = QtCore.Signal(object)
     finished = QtCore.Signal(bool, str, str, object)
 
-    def __init__(self, video_path: str, params: ExtractParams, output_dir: str):
+    def __init__(
+        self,
+        video_path: str,
+        params: ExtractParams,
+        output_dir: str,
+        step: Optional[int] = None,
+        force: bool = False,
+    ):
         super().__init__()
         self._video_path = video_path
         self._params = params
         self._output_dir = output_dir
+        self._step = step
+        self._force = force
         self._stop = False
 
     def stop(self) -> None:
@@ -253,14 +264,26 @@ class ExtractWorker(QtCore.QObject):
             return self._stop
 
         try:
-            output_dir, _results, raw_frames = extract_pages(
-                self._video_path,
-                self._params,
-                output_dir=self._output_dir,
-                progress_cb=_progress,
-                should_stop=_should_stop,
-                on_item=lambda item: self.item_ready.emit(item),
-            )
+            if self._step is None:
+                output_dir, _results, raw_frames = extract_pages(
+                    self._video_path,
+                    self._params,
+                    output_dir=self._output_dir,
+                    progress_cb=_progress,
+                    should_stop=_should_stop,
+                    on_item=lambda item: self.item_ready.emit(item),
+                )
+            else:
+                output_dir, _results, raw_frames = run_step(
+                    self._video_path,
+                    self._params,
+                    output_dir=self._output_dir,
+                    step=self._step,
+                    force=self._force,
+                    progress_cb=_progress,
+                    should_stop=_should_stop,
+                    on_item=lambda item: self.item_ready.emit(item),
+                )
             if self._stop:
                 self.finished.emit(False, "Canceled", output_dir, raw_frames)
             else:
@@ -285,6 +308,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._raw_frames: List[RawFrame] = []
         self._preview_time_s = 1.0
         self._page_item_map: Dict[int, QtWidgets.QListWidgetItem] = {}
+        self._step_status_labels: Dict[int, QtWidgets.QLabel] = {}
+        self._step_buttons: List[QtWidgets.QPushButton] = []
 
         self._preset_map = self._build_presets()
 
@@ -446,23 +471,6 @@ class MainWindow(QtWidgets.QMainWindow):
         preview_layout.addWidget(self.preview_canvas)
         layout.addWidget(preview_group)
 
-        actions_group = QtWidgets.QGroupBox("Actions")
-        actions_layout = QtWidgets.QVBoxLayout(actions_group)
-        self.extract_btn = QtWidgets.QPushButton("Extract pages")
-        self.extract_btn.clicked.connect(self._start_extract)
-        self.stop_btn = QtWidgets.QPushButton("Stop")
-        self.stop_btn.clicked.connect(self._stop_extract)
-        self.stop_btn.setEnabled(False)
-        self.open_folder_btn = QtWidgets.QPushButton("Open output folder")
-        self.open_folder_btn.clicked.connect(self._open_output_folder)
-        self.open_folder_btn.setEnabled(False)
-
-        actions_layout.addWidget(self.extract_btn)
-        actions_layout.addWidget(self.stop_btn)
-        actions_layout.addWidget(self.open_folder_btn)
-        actions_layout.addStretch()
-        layout.addWidget(actions_group)
-
         layout.addStretch()
 
         self._apply_preset(self.preset_combo.currentText())
@@ -471,6 +479,56 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_center_panel(self) -> QtWidgets.QWidget:
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
+
+        actions_group = QtWidgets.QGroupBox("Actions")
+        actions_layout = QtWidgets.QVBoxLayout(actions_group)
+
+        self.extract_btn = QtWidgets.QPushButton("Run all")
+        self.extract_btn.clicked.connect(self._start_extract)
+        actions_layout.addWidget(self.extract_btn)
+
+        steps_layout = QtWidgets.QGridLayout()
+        steps_layout.setHorizontalSpacing(8)
+        steps_layout.setVerticalSpacing(4)
+
+        steps = [
+            (1, "Extract frames"),
+            (2, "Transcribe frames"),
+            (3, "Mark duplication"),
+            (4, "Create summary"),
+        ]
+        for row, (step_id, label) in enumerate(steps):
+            status_label = QtWidgets.QLabel("[ ]")
+            status_label.setFixedWidth(28)
+            status_label.setAlignment(QtCore.Qt.AlignCenter)
+            self._step_status_labels[step_id] = status_label
+
+            label_widget = QtWidgets.QLabel(f"{step_id}. {label}")
+            run_btn = QtWidgets.QPushButton("Run")
+            run_btn.clicked.connect(partial(self._start_step, step_id))
+            scratch_btn = QtWidgets.QPushButton("Clear")
+            scratch_btn.clicked.connect(partial(self._clear_step, step_id))
+
+            self._step_buttons.extend([run_btn, scratch_btn])
+
+            steps_layout.addWidget(status_label, row, 0)
+            steps_layout.addWidget(label_widget, row, 1)
+            steps_layout.addWidget(run_btn, row, 2)
+            steps_layout.addWidget(scratch_btn, row, 3)
+
+        steps_layout.setColumnStretch(1, 1)
+        actions_layout.addLayout(steps_layout)
+
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.stop_btn.clicked.connect(self._stop_extract)
+        self.stop_btn.setEnabled(False)
+        self.open_folder_btn = QtWidgets.QPushButton("Open output folder")
+        self.open_folder_btn.clicked.connect(self._open_output_folder)
+        self.open_folder_btn.setEnabled(False)
+        actions_layout.addWidget(self.stop_btn)
+        actions_layout.addWidget(self.open_folder_btn)
+
+        layout.addWidget(actions_group)
 
         status_group = QtWidgets.QGroupBox("Progress")
         status_layout = QtWidgets.QVBoxLayout(status_group)
@@ -670,23 +728,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return True
         return os.path.isdir(pages_dir) and bool(os.listdir(pages_dir))
 
-    def _start_extract(self) -> None:
-        if not self._video_path:
-            QtWidgets.QMessageBox.warning(self, "No video", "Please select a video file")
-            return
-        if self._extract_worker:
-            QtWidgets.QMessageBox.warning(self, "Busy", "Extraction is already running")
-            return
-
-        if not self._ensure_output_root():
-            return
-
+    def _resolve_output_dir(self, allow_create: bool, allow_complete: bool = False) -> Optional[str]:
         output_dir: Optional[str] = None
-        if self._output_dir and self._is_output_dir_incomplete(self._output_dir):
+        if self._output_dir and (allow_complete or self._is_output_dir_incomplete(self._output_dir)):
             session = self._load_session(self._output_dir)
             session_video = session.get("video_path") if isinstance(session, dict) else None
             if session_video and os.path.normpath(str(session_video)) == os.path.normpath(
-                self._video_path
+                self._video_path or ""
             ):
                 output_dir = self._output_dir
                 base_interval = (
@@ -701,18 +749,40 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.analysis_interval_spin.setValue(float(base_interval))
                     except (TypeError, ValueError, ZeroDivisionError):
                         pass
-        if output_dir is None:
+        if output_dir is None and allow_create:
             output_dir = self._create_output_dir()
-            if not output_dir:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Output folder unavailable",
-                    "Failed to create a new output folder.",
-                )
-                return
+        return output_dir
+
+    def _set_action_buttons_enabled(self, enabled: bool) -> None:
+        self.extract_btn.setEnabled(enabled)
+        for btn in self._step_buttons:
+            btn.setEnabled(enabled)
+        self.stop_btn.setEnabled(not enabled)
+        self.open_folder_btn.setEnabled(self._output_dir is not None)
+
+    def _start_extract(self) -> None:
+        if not self._video_path:
+            QtWidgets.QMessageBox.warning(self, "No video", "Please select a video file")
+            return
+        if self._extract_worker:
+            QtWidgets.QMessageBox.warning(self, "Busy", "Extraction is already running")
+            return
+
+        if not self._ensure_output_root():
+            return
+
+        output_dir = self._resolve_output_dir(allow_create=True, allow_complete=False)
+        if output_dir is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Output folder unavailable",
+                "Failed to create a new output folder.",
+            )
+            return
 
         self._reset_results()
         self._output_dir = output_dir
+        self._refresh_step_status()
         if output_dir == self._output_dir and os.path.exists(
             os.path.join(output_dir, "session.json")
         ):
@@ -733,9 +803,188 @@ class MainWindow(QtWidgets.QMainWindow):
         self._extract_worker.finished.connect(self._on_extract_finished)
         self._extract_thread.start()
 
-        self.extract_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.open_folder_btn.setEnabled(True)
+        self._set_action_buttons_enabled(False)
+
+    def _start_step(self, step_id: int) -> None:
+        if not self._video_path:
+            QtWidgets.QMessageBox.warning(self, "No video", "Please select a video file")
+            return
+        if self._extract_worker:
+            QtWidgets.QMessageBox.warning(self, "Busy", "Extraction is already running")
+            return
+        if not self._ensure_output_root():
+            return
+
+        allow_create = step_id == 1
+        output_dir = self._resolve_output_dir(
+            allow_create=allow_create,
+            allow_complete=True,
+        )
+        if output_dir is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Output folder missing",
+                "Please run extract frames first or resume from an output folder.",
+            )
+            return
+
+        if step_id > 1 and not os.path.exists(os.path.join(output_dir, "pages_raw.json")):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing frames",
+                "pages_raw.json not found. Run extract frames first.",
+            )
+            return
+
+        if step_id == 1:
+            self._reset_results()
+        else:
+            self._reset_progress_only()
+        self._output_dir = output_dir
+        self._refresh_step_status()
+        if os.path.exists(os.path.join(output_dir, "session.json")):
+            self._log(f"Using output folder: {output_dir}")
+        else:
+            self._log(f"Output folder: {output_dir}")
+
+        params = self._collect_params()
+        if not os.path.exists(os.path.join(output_dir, "session.json")):
+            self._write_session(output_dir, params)
+
+        self._extract_thread = QtCore.QThread()
+        self._extract_worker = ExtractWorker(
+            self._video_path,
+            params,
+            self._output_dir,
+            step=step_id,
+            force=False,
+        )
+        self._extract_worker.moveToThread(self._extract_thread)
+
+        self._extract_thread.started.connect(self._extract_worker.run)
+        self._extract_worker.progress.connect(self._on_progress)
+        self._extract_worker.item_ready.connect(self._on_item_ready)
+        self._extract_worker.finished.connect(self._on_extract_finished)
+        self._extract_thread.start()
+
+        self._set_action_buttons_enabled(False)
+
+    def _clear_step(self, step_id: int) -> None:
+        if self._extract_worker:
+            QtWidgets.QMessageBox.warning(self, "Busy", "Extraction is already running")
+            return
+
+        output_dir = self._resolve_output_dir(allow_create=False, allow_complete=True)
+        if output_dir is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Output folder missing",
+                "Please run extract frames first or resume from an output folder.",
+            )
+            return
+
+        if step_id > 1 and not os.path.exists(os.path.join(output_dir, "pages_raw.json")):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing frames",
+                "pages_raw.json not found. Run extract frames first.",
+            )
+            return
+
+        step_label = {
+            1: "Extract frames",
+            2: "Transcribe frames",
+            3: "Mark duplication",
+            4: "Create summary",
+        }.get(step_id, f"Step {step_id}")
+        message = (
+            f"Clear outputs for '{step_label}'?\n"
+            "This will delete the step results (and downstream files)."
+        )
+        result = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm clear",
+            message,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if result != QtWidgets.QMessageBox.Yes:
+            self._log("Clear canceled.")
+            return
+
+        self._clear_step_outputs(step_id, output_dir)
+        if step_id == 1:
+            self._reset_results()
+            self._output_dir = output_dir
+        else:
+            self._reset_progress_only()
+            self._output_dir = output_dir
+        self._refresh_step_status()
+        self._log(f"Cleared step {step_id}.")
+
+    def _clear_step_outputs(self, step_id: int, output_dir: str) -> None:
+        pages_dir = os.path.join(output_dir, "pages")
+        raw_path = os.path.join(output_dir, "pages_raw.json")
+
+        if step_id == 1:
+            if os.path.isdir(pages_dir):
+                shutil.rmtree(pages_dir)
+            for name in ("pages_raw.json", "pages_selected.json", "final_summary.txt"):
+                path = os.path.join(output_dir, name)
+                if os.path.exists(path):
+                    os.remove(path)
+            return
+
+        if step_id == 2:
+            if os.path.isdir(pages_dir):
+                for name in os.listdir(pages_dir):
+                    if name.endswith(".txt"):
+                        os.remove(os.path.join(pages_dir, name))
+            raw_data = self._load_json_file(raw_path)
+            if raw_data and isinstance(raw_data.get("items"), list):
+                for item in raw_data["items"]:
+                    if isinstance(item, dict):
+                        item["ocr_text"] = None
+                        item["sim_prev"] = None
+                with open(raw_path, "w", encoding="utf-8") as f:
+                    json.dump(raw_data, f, ensure_ascii=False, indent=2)
+            for name in ("pages_selected.json", "final_summary.txt"):
+                path = os.path.join(output_dir, name)
+                if os.path.exists(path):
+                    os.remove(path)
+
+            for i in range(self.thumb_list.count()):
+                item = self.thumb_list.item(i)
+                data = item.data(QtCore.Qt.UserRole)
+                if isinstance(data, PageItem):
+                    data.ocr_text = None
+                    data.is_selected = None
+                    item.setData(QtCore.Qt.UserRole, data)
+                    self._apply_page_item_style(item, data)
+            self.transcript_view.clear()
+            self._refresh_item_labels()
+            return
+
+        if step_id == 3:
+            for name in ("pages_selected.json", "final_summary.txt"):
+                path = os.path.join(output_dir, name)
+                if os.path.exists(path):
+                    os.remove(path)
+            for i in range(self.thumb_list.count()):
+                item = self.thumb_list.item(i)
+                data = item.data(QtCore.Qt.UserRole)
+                if isinstance(data, PageItem):
+                    data.is_selected = None
+                    item.setData(QtCore.Qt.UserRole, data)
+                    self._apply_page_item_style(item, data)
+            self._refresh_item_labels()
+            return
+
+        if step_id == 4:
+            summary_path = os.path.join(output_dir, "final_summary.txt")
+            if os.path.exists(summary_path):
+                os.remove(summary_path)
+            return
 
     def _stop_extract(self) -> None:
         if self._extract_worker:
@@ -791,6 +1040,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._reset_results()
         self._output_dir = output_dir
+        self._refresh_step_status()
         self._log(f"Resuming output folder: {output_dir}")
 
         params = self._collect_params()
@@ -804,9 +1054,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._extract_worker.finished.connect(self._on_extract_finished)
         self._extract_thread.start()
 
-        self.extract_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.open_folder_btn.setEnabled(True)
+        self._set_action_buttons_enabled(False)
 
     def _on_progress(self, percent: int, message: str) -> None:
         self.progress_bar.setValue(percent)
@@ -830,10 +1078,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._extract_worker = None
 
         self._raw_frames = raw_frames if isinstance(raw_frames, list) else []
-        self.extract_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
         self._output_dir = output_dir
-        self.open_folder_btn.setEnabled(self._output_dir is not None)
+        self._refresh_step_status()
+        self._set_action_buttons_enabled(True)
 
     def _add_page_item(self, item: PageItem) -> None:
         pixmap = QtGui.QPixmap(item.image_path)
@@ -872,6 +1119,49 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             list_item.setForeground(self.thumb_list.palette().brush(QtGui.QPalette.Text))
 
+    def _reset_progress_only(self) -> None:
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Idle")
+        self.log_view.clear()
+
+    def _load_json_file(self, path: str) -> Optional[Dict[str, object]]:
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _refresh_step_status(self) -> None:
+        if not self._step_status_labels:
+            return
+        if not self._output_dir:
+            for label in self._step_status_labels.values():
+                label.setText("[ ]")
+            return
+
+        raw_path = os.path.join(self._output_dir, "pages_raw.json")
+        raw_data = self._load_json_file(raw_path)
+        step1_done = raw_data is not None
+        step2_done = False
+        if raw_data:
+            items = raw_data.get("items", [])
+            if isinstance(items, list) and items:
+                step2_done = all((item.get("ocr_text") or "").strip() for item in items)
+
+        step3_done = os.path.exists(os.path.join(self._output_dir, "pages_selected.json"))
+        step4_done = os.path.exists(os.path.join(self._output_dir, "final_summary.txt"))
+
+        statuses = {
+            1: step1_done,
+            2: step2_done,
+            3: step3_done,
+            4: step4_done,
+        }
+        for step_id, label in self._step_status_labels.items():
+            label.setText("[x]" if statuses.get(step_id) else "[ ]")
+
     def _reset_results(self) -> None:
         self.thumb_list.clear()
         self._update_page_count()
@@ -885,6 +1175,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._page_item_map = {}
         if hasattr(self, "open_folder_btn"):
             self.open_folder_btn.setEnabled(False)
+        self._refresh_step_status()
 
     def _refresh_preview(self, *args: object) -> None:
         if not self._video_path:
