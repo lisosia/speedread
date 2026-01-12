@@ -586,11 +586,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transcript_view.customContextMenuRequested.connect(self._copy_transcription)
         transcript_layout.addWidget(self.transcript_view)
 
+        summary_group = QtWidgets.QGroupBox("Summary")
+        summary_layout = QtWidgets.QVBoxLayout(summary_group)
+        self.summary_view = QtWidgets.QTextEdit()
+        self.summary_view.setReadOnly(True)
+        self.summary_view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.summary_view.customContextMenuRequested.connect(self._copy_summary)
+        summary_layout.addWidget(self.summary_view)
+
         splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         splitter.addWidget(self.thumb_container)
         splitter.addWidget(transcript_group)
+        splitter.addWidget(summary_group)
         splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 1)
 
         layout.addWidget(splitter, 1)
         return widget
@@ -783,6 +793,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._reset_results()
         self._output_dir = output_dir
         self._refresh_step_status()
+        self._refresh_summary_view()
         if output_dir == self._output_dir and os.path.exists(
             os.path.join(output_dir, "session.json")
         ):
@@ -842,6 +853,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._reset_progress_only()
         self._output_dir = output_dir
         self._refresh_step_status()
+        self._refresh_summary_view()
         if os.path.exists(os.path.join(output_dir, "session.json")):
             self._log(f"Using output folder: {output_dir}")
         else:
@@ -920,6 +932,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._reset_progress_only()
             self._output_dir = output_dir
         self._refresh_step_status()
+        self._refresh_summary_view()
         self._log(f"Cleared step {step_id}.")
 
     def _clear_step_outputs(self, step_id: int, output_dir: str) -> None:
@@ -1041,6 +1054,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._reset_results()
         self._output_dir = output_dir
         self._refresh_step_status()
+        self._refresh_summary_view()
         self._log(f"Resuming output folder: {output_dir}")
 
         params = self._collect_params()
@@ -1080,6 +1094,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._raw_frames = raw_frames if isinstance(raw_frames, list) else []
         self._output_dir = output_dir
         self._refresh_step_status()
+        self._refresh_summary_view()
         self._set_action_buttons_enabled(True)
 
     def _add_page_item(self, item: PageItem) -> None:
@@ -1123,6 +1138,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress_bar.setValue(0)
         self.status_label.setText("Idle")
         self.log_view.clear()
+
+    def _refresh_summary_view(self) -> None:
+        if not hasattr(self, "summary_view"):
+            return
+        if not self._output_dir:
+            self.summary_view.clear()
+            return
+        summary_path = os.path.join(self._output_dir, "final_summary.txt")
+        if not os.path.exists(summary_path):
+            self.summary_view.setPlainText("Summary not available.")
+            return
+        try:
+            with open(summary_path, "r", encoding="utf-8") as f:
+                self.summary_view.setPlainText(f.read())
+        except OSError:
+            self.summary_view.setPlainText("Summary not available.")
 
     def _load_json_file(self, path: str) -> Optional[Dict[str, object]]:
         if not os.path.exists(path):
@@ -1170,6 +1201,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_view.clear()
         self._raw_frames = []
         self.transcript_view.clear()
+        if hasattr(self, "summary_view"):
+            self.summary_view.clear()
         self._refresh_preview()
         self._output_dir = None
         self._page_item_map = {}
@@ -1285,6 +1318,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         QtWidgets.QApplication.clipboard().setText(text)
         self._log("Transcription copied to clipboard.")
+
+    def _copy_summary(self, *args: object) -> None:
+        text = self.summary_view.toPlainText()
+        if not text:
+            self._log("No summary to copy.")
+            return
+        QtWidgets.QApplication.clipboard().setText(text)
+        self._log("Summary copied to clipboard.")
 
     def _log(self, message: str) -> None:
         self.log_view.append(message)
