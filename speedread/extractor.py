@@ -42,6 +42,8 @@ class ExtractParams:
     use_quad_in_score: bool = False
     motion_weight: float = 0.7
     quad_weight: float = 0.15
+    crop_enabled: bool = False
+    crop_rect_norm: Optional[List[float]] = None
 
 
 @dataclass
@@ -91,6 +93,26 @@ def rotate_frame(frame: np.ndarray, rotation_degrees: int) -> np.ndarray:
     if rotation == 270:
         return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
     return frame
+
+
+def _apply_crop(frame: np.ndarray, params: ExtractParams) -> np.ndarray:
+    if not params.crop_enabled or not params.crop_rect_norm:
+        return frame
+    if len(params.crop_rect_norm) != 4:
+        return frame
+    h, w = frame.shape[:2]
+    x_norm, y_norm, w_norm, h_norm = params.crop_rect_norm
+    x = int(round(max(0.0, min(1.0, x_norm)) * w))
+    y = int(round(max(0.0, min(1.0, y_norm)) * h))
+    cw = int(round(max(0.0, min(1.0, w_norm)) * w))
+    ch = int(round(max(0.0, min(1.0, h_norm)) * h))
+    if cw <= 0 or ch <= 0:
+        return frame
+    x2 = min(w, x + cw)
+    y2 = min(h, y + ch)
+    if x2 <= x or y2 <= y:
+        return frame
+    return frame[y:y2, x:x2]
 
 
 def decode_analysis_frames(
@@ -516,6 +538,7 @@ def compute_text_change_series(
                 time_ms=info.get("time_ms"),
                 rotation_degrees=params.rotation_degrees,
             )
+            frame = _apply_crop(frame, params)
             image_path = ""
             if pages_dir is not None:
                 image_path = os.path.join(pages_dir, f"page_{idx + 1:04d}.png")
@@ -982,6 +1005,7 @@ def extract_pages(
                     time_ms=timestamp_ms,
                     rotation_degrees=params.rotation_degrees,
                 )
+                frame = _apply_crop(frame, params)
                 cv2.imwrite(image_path, frame)
             text_path = os.path.join(pages_dir, f"page_{raw_index:04d}.txt")
             ocr_text = item.get("ocr_text")
@@ -1048,6 +1072,7 @@ def extract_pages(
                     time_ms=info.get("time_ms"),
                     rotation_degrees=params.rotation_degrees,
                 )
+                frame = _apply_crop(frame, params)
                 cv2.imwrite(image_path, frame)
             text_path = os.path.join(pages_dir, f"page_{idx:04d}.txt")
             ocr_text = _read_text_file(text_path)
@@ -1284,6 +1309,7 @@ def extract_single_frame(
 
     cap = cv2.VideoCapture(video_path)
     frame = extract_highres_frame(cap, time_ms=time_ms, rotation_degrees=params.rotation_degrees)
+    frame = _apply_crop(frame, params)
     cap.release()
 
     quad_points = None

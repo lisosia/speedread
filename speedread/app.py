@@ -12,6 +12,224 @@ from .extractor import ExtractParams, extract_highres_frame, extract_pages
 from .models import PageItem, RawFrame
 
 
+class CropPreview(QtWidgets.QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMouseTracking(True)
+        self._image: Optional[QtGui.QImage] = None
+        self._image_rect = QtCore.QRectF()
+        self._crop_enabled = False
+        self._crop_rect_norm: Optional[QtCore.QRectF] = None
+        self._dragging = False
+        self._drag_offset = QtCore.QPointF()
+        self._drag_mode: Optional[str] = None
+        self._drag_rect = QtCore.QRectF()
+        self._min_rect_size = 20.0
+        self._hit_margin = 12.0
+
+    def set_image(self, image: Optional[QtGui.QImage]) -> None:
+        self._image = image
+        if self._crop_enabled:
+            self._ensure_default_crop()
+        self.update()
+
+    def set_crop_enabled(self, enabled: bool) -> None:
+        self._crop_enabled = enabled
+        if enabled:
+            self._ensure_default_crop()
+        if not enabled:
+            self.unsetCursor()
+        self.update()
+
+    def set_crop_rect_norm(self, rect: Optional[QtCore.QRectF]) -> None:
+        self._crop_rect_norm = rect
+        self.update()
+
+    def crop_rect_norm(self) -> Optional[QtCore.QRectF]:
+        return self._crop_rect_norm
+
+    def _ensure_default_crop(self) -> None:
+        if self._crop_rect_norm is None and self._image is not None:
+            self._crop_rect_norm = QtCore.QRectF(0.1, 0.1, 0.8, 0.8)
+
+    def _crop_rect_widget(self) -> Optional[QtCore.QRectF]:
+        if not self._image or not self._crop_rect_norm or self._image_rect.isNull():
+            return None
+        img_w = self._image.width()
+        img_h = self._image.height()
+        scale = min(
+            self._image_rect.width() / img_w,
+            self._image_rect.height() / img_h,
+        )
+        rect_px = QtCore.QRectF(
+            self._crop_rect_norm.x() * img_w,
+            self._crop_rect_norm.y() * img_h,
+            self._crop_rect_norm.width() * img_w,
+            self._crop_rect_norm.height() * img_h,
+        )
+        return QtCore.QRectF(
+            self._image_rect.x() + rect_px.x() * scale,
+            self._image_rect.y() + rect_px.y() * scale,
+            rect_px.width() * scale,
+            rect_px.height() * scale,
+        )
+
+    def _hit_test(self, rect: QtCore.QRectF, pos: QtCore.QPointF) -> Optional[str]:
+        margin = self._hit_margin
+        left = abs(pos.x() - rect.left()) <= margin
+        right = abs(pos.x() - rect.right()) <= margin
+        top = abs(pos.y() - rect.top()) <= margin
+        bottom = abs(pos.y() - rect.bottom()) <= margin
+        inside = rect.adjusted(margin, margin, -margin, -margin).contains(pos)
+
+        if left and top:
+            return "resize_tl"
+        if right and top:
+            return "resize_tr"
+        if left and bottom:
+            return "resize_bl"
+        if right and bottom:
+            return "resize_br"
+        if left:
+            return "resize_l"
+        if right:
+            return "resize_r"
+        if top:
+            return "resize_t"
+        if bottom:
+            return "resize_b"
+        if inside:
+            return "move"
+        return None
+
+    def _update_cursor(self, mode: Optional[str]) -> None:
+        if not self._crop_enabled or mode is None:
+            self.unsetCursor()
+            return
+        cursor_map = {
+            "resize_tl": QtCore.Qt.SizeFDiagCursor,
+            "resize_br": QtCore.Qt.SizeFDiagCursor,
+            "resize_tr": QtCore.Qt.SizeBDiagCursor,
+            "resize_bl": QtCore.Qt.SizeBDiagCursor,
+            "resize_l": QtCore.Qt.SizeHorCursor,
+            "resize_r": QtCore.Qt.SizeHorCursor,
+            "resize_t": QtCore.Qt.SizeVerCursor,
+            "resize_b": QtCore.Qt.SizeVerCursor,
+            "move": QtCore.Qt.SizeAllCursor,
+        }
+        self.setCursor(cursor_map.get(mode, QtCore.Qt.ArrowCursor))
+
+    def _update_crop_from_widget_rect(self, rect: QtCore.QRectF) -> None:
+        if not self._image or self._image_rect.isNull():
+            return
+        img_w = self._image.width()
+        img_h = self._image.height()
+        scale = min(
+            self._image_rect.width() / img_w,
+            self._image_rect.height() / img_h,
+        )
+        x = (rect.x() - self._image_rect.x()) / (img_w * scale)
+        y = (rect.y() - self._image_rect.y()) / (img_h * scale)
+        w = rect.width() / (img_w * scale)
+        h = rect.height() / (img_h * scale)
+        x = max(0.0, min(1.0 - w, x))
+        y = max(0.0, min(1.0 - h, y))
+        self._crop_rect_norm = QtCore.QRectF(x, y, w, h)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), QtGui.QColor(30, 30, 30))
+        if not self._image:
+            painter.setPen(QtGui.QColor(180, 180, 180))
+            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "No preview")
+            return
+
+        img_w = self._image.width()
+        img_h = self._image.height()
+        scale = min(self.width() / img_w, self.height() / img_h)
+        draw_w = img_w * scale
+        draw_h = img_h * scale
+        x = (self.width() - draw_w) / 2
+        y = (self.height() - draw_h) / 2
+        self._image_rect = QtCore.QRectF(x, y, draw_w, draw_h)
+        painter.drawImage(self._image_rect, self._image)
+
+        if self._crop_enabled and self._crop_rect_norm:
+            rect = self._crop_rect_widget()
+            if rect:
+                pen = QtGui.QPen(QtGui.QColor(0, 220, 120), 2)
+                painter.setPen(pen)
+                painter.drawRect(rect)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if not self._crop_enabled:
+            return
+        rect = self._crop_rect_widget()
+        if rect:
+            mode = self._hit_test(rect, event.position())
+            self._update_cursor(mode)
+        else:
+            mode = None
+        if rect and mode:
+            self._dragging = True
+            self._drag_mode = mode
+            self._drag_rect = QtCore.QRectF(rect)
+            if mode == "move":
+                self._drag_offset = event.position() - rect.topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if not self._crop_enabled:
+            return
+        rect = self._crop_rect_widget()
+        if not self._dragging:
+            if rect:
+                self._update_cursor(self._hit_test(rect, event.position()))
+            return
+        if not self._dragging:
+            return
+        if not rect or self._image_rect.isNull():
+            return
+        new_rect = QtCore.QRectF(self._drag_rect)
+        pos = event.position()
+        min_w = self._min_rect_size
+        min_h = self._min_rect_size
+
+        if self._drag_mode == "move":
+            new_top_left = pos - self._drag_offset
+            max_x = self._image_rect.right() - new_rect.width()
+            max_y = self._image_rect.bottom() - new_rect.height()
+            new_x = max(self._image_rect.left(), min(max_x, new_top_left.x()))
+            new_y = max(self._image_rect.top(), min(max_y, new_top_left.y()))
+            new_rect.moveTo(new_x, new_y)
+        else:
+            left = new_rect.left()
+            right = new_rect.right()
+            top = new_rect.top()
+            bottom = new_rect.bottom()
+
+            if self._drag_mode in ("resize_tl", "resize_l", "resize_bl"):
+                left = max(self._image_rect.left(), min(pos.x(), right - min_w))
+            if self._drag_mode in ("resize_tr", "resize_r", "resize_br"):
+                right = min(self._image_rect.right(), max(pos.x(), left + min_w))
+            if self._drag_mode in ("resize_tl", "resize_t", "resize_tr"):
+                top = max(self._image_rect.top(), min(pos.y(), bottom - min_h))
+            if self._drag_mode in ("resize_bl", "resize_b", "resize_br"):
+                bottom = min(self._image_rect.bottom(), max(pos.y(), top + min_h))
+
+            new_rect = QtCore.QRectF(
+                QtCore.QPointF(left, top), QtCore.QPointF(right, bottom)
+            )
+
+        self._update_crop_from_widget_rect(new_rect)
+        self.update()
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        self._dragging = False
+        self._drag_mode = None
+
+
 class ExtractWorker(QtCore.QObject):
     progress = QtCore.Signal(int, str)
     item_ready = QtCore.Signal(object)
@@ -220,12 +438,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         preview_group = QtWidgets.QGroupBox("Preview")
         preview_layout = QtWidgets.QVBoxLayout(preview_group)
-        self.preview_label = QtWidgets.QLabel("No preview")
-        self.preview_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.preview_label.setMinimumSize(200, 260)
-        self.preview_label.setFrameShape(QtWidgets.QFrame.Box)
-        self.preview_label.setFrameShadow(QtWidgets.QFrame.Sunken)
-        preview_layout.addWidget(self.preview_label)
+        self.crop_check = QtWidgets.QCheckBox("Enable crop")
+        self.crop_check.toggled.connect(self._on_crop_toggled)
+        preview_layout.addWidget(self.crop_check)
+        self.preview_canvas = CropPreview()
+        self.preview_canvas.setMinimumSize(200, 260)
+        preview_layout.addWidget(self.preview_canvas)
         layout.addWidget(preview_group)
 
         actions_group = QtWidgets.QGroupBox("Actions")
@@ -335,6 +553,10 @@ class MainWindow(QtWidgets.QMainWindow):
         prompt_key = self.llm_prompt_combo.currentData()
         if not prompt_key:
             prompt_key = "general"
+        crop_rect = None
+        rect = self.preview_canvas.crop_rect_norm()
+        if self.crop_check.isChecked() and rect is not None:
+            crop_rect = [rect.x(), rect.y(), rect.width(), rect.height()]
         return ExtractParams(
             analysis_interval_s=self.analysis_interval_spin.value(),
             analysis_long_side=int(self.analysis_long_side_combo.currentData() or 0),
@@ -345,6 +567,8 @@ class MainWindow(QtWidgets.QMainWindow):
             llm_prompt_key=str(prompt_key),
             llm_split_4=self.llm_split_check.isChecked(),
             llm_max_tokens=self.llm_max_tokens_spin.value(),
+            crop_enabled=self.crop_check.isChecked(),
+            crop_rect_norm=crop_rect,
         )
 
     def _set_analysis_long_side(self, value: int) -> None:
@@ -366,6 +590,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.video_path_edit.setText(path)
         self._log(f"Loaded video: {path}")
         self._refresh_preview()
+
+    def _on_crop_toggled(self, checked: bool) -> None:
+        self.preview_canvas.set_crop_enabled(checked)
 
     def _load_output_root(self) -> Optional[str]:
         value = self._settings.value("output_root", "", str)
@@ -417,6 +644,8 @@ class MainWindow(QtWidgets.QMainWindow):
         data = {
             "video_path": self._video_path,
             "base_interval_s": params.analysis_interval_s,
+            "crop_enabled": params.crop_enabled,
+            "crop_rect_norm": params.crop_rect_norm,
         }
         path = os.path.join(output_dir, "session.json")
         with open(path, "w", encoding="utf-8") as f:
@@ -545,6 +774,19 @@ class MainWindow(QtWidgets.QMainWindow):
             except (TypeError, ValueError, ZeroDivisionError):
                 pass
 
+        crop_enabled = bool(session.get("crop_enabled")) if isinstance(session, dict) else False
+        crop_rect = session.get("crop_rect_norm") if isinstance(session, dict) else None
+        self.crop_check.setChecked(crop_enabled)
+        rect_obj = None
+        if isinstance(crop_rect, (list, tuple)) and len(crop_rect) == 4:
+            rect_obj = QtCore.QRectF(
+                float(crop_rect[0]),
+                float(crop_rect[1]),
+                float(crop_rect[2]),
+                float(crop_rect[3]),
+            )
+        self.preview_canvas.set_crop_rect_norm(rect_obj)
+
         self._reset_results()
         self._output_dir = output_dir
         self._log(f"Resuming output folder: {output_dir}")
@@ -644,8 +886,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_preview(self, *args: object) -> None:
         if not self._video_path:
-            self.preview_label.setText("No preview")
-            self.preview_label.setPixmap(QtGui.QPixmap())
+            self.preview_canvas.set_image(None)
             return
 
         rotation_value = self.rotation_combo.currentData()
@@ -654,8 +895,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         cap = cv2.VideoCapture(self._video_path)
         if not cap.isOpened():
-            self.preview_label.setText("Preview unavailable")
-            self.preview_label.setPixmap(QtGui.QPixmap())
+            self.preview_canvas.set_image(None)
             return
 
         try:
@@ -684,29 +924,20 @@ class MainWindow(QtWidgets.QMainWindow):
                     rotation_degrees=int(rotation_value),
                 )
         except Exception:
-            self.preview_label.setText("Preview unavailable")
-            self.preview_label.setPixmap(QtGui.QPixmap())
+            self.preview_canvas.set_image(None)
             return
         finally:
             cap.release()
 
         if frame is None:
-            self.preview_label.setText("Preview unavailable")
-            self.preview_label.setPixmap(QtGui.QPixmap())
+            self.preview_canvas.set_image(None)
             return
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
         image = QtGui.QImage(rgb.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888).copy()
-        pixmap = QtGui.QPixmap.fromImage(image)
-        pixmap = pixmap.scaled(
-            self.preview_label.size(),
-            QtCore.Qt.KeepAspectRatio,
-            QtCore.Qt.SmoothTransformation,
-        )
-        self.preview_label.setText("")
-        self.preview_label.setPixmap(pixmap)
+        self.preview_canvas.set_image(image)
 
     def _refresh_item_labels(self, *args: object) -> None:
         for i in range(self.thumb_list.count()):
